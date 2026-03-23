@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+.venv/
+*.pt
+*.pth
+*.onnx
+data/raw/
+data/processed/
+outputs/
+models/weights/
+models/checkpoints/
+*.log
+.DS_Store
+Thumbs.db

@@ -1,0 +1,42 @@
+# Project Configuration
+
+project:
+  name: "Park Detection AI"
+  version: "0.1.0"
+
+model:
+  yolo:
+    model_size: "yolov8n"  # n/s/m/l/x
+    weights: "yolov8n.pt"
+    confidence_threshold: 0.5
+    iou_threshold: 0.45
+    target_classes: [2, 3, 5, 7]  # COCO: car, motorcycle, bus, truck
+  mobilenet:
+    input_size: [224, 224]
+    num_classes: 3
+
+training:
+  epochs: 50
+  batch_size: 16
+  learning_rate: 0.001
+  image_size: 640
+  split:
+    train: 0.70
+    val: 0.15
+    test: 0.15
+
+classes:
+  - "Park Edilebilir"
+  - "Park Edilemez"
+  - "Park Alani Dolu"
+
+data:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  annotations_dir: "data/annotations"
+
+output:
+  visualizations: "outputs/visualizations"
+  metrics: "outputs/metrics"
+  videos: "outputs/videos"
+  model_checkpoints: "models/checkpoints"
