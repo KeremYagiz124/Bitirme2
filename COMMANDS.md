@@ -51,6 +51,18 @@ python scripts/annotate_zones.py --image data/raw/otopark.jpg --output data/anno
 
 ---
 
+## Arayüz (GUI)
+
+```bash
+# Proje kök dizininden çalıştır
+python -m src.main
+```
+
+Açılan pencerede:
+- "▶ Kamera" — webcam başlatır
+- "📂 Video Yükle" — mp4/avi/mkv seçer
+- "■ Durdur" — durdurur
+
 ## Kurulum
 
 ```bash
