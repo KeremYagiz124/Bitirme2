@@ -1,4 +1,6 @@
 # Project Configuration
+# Multi-user compatible - uses relative paths only
+# User-specific overrides go in config.local.yaml (not tracked by git)
 
 project:
   name: "Park Detection AI"
@@ -6,11 +8,25 @@ project:
 
 model:
   yolo:
-    model_size: "yolov8n"  # n/s/m/l/x
+    model_size: "yolov8n"
     weights: "yolov8n.pt"
-    confidence_threshold: 0.5
+    cache_dir: "./models/cache"
+    conf_threshold: 0.5
     iou_threshold: 0.45
-    target_classes: [2, 3, 5, 7]  # COCO: car, motorcycle, bus, truck
+    target_classes: [2, 3, 5, 7]
+
+data:
+  synthetic_dir: "./data/synthetic"
+  raw_dir: "./data/raw"
+  processed_dir: "./data/processed"
+  annotations_dir: "./data/annotations"
+
+ui:
+  theme: "dark"
+  default_window_width: 1280
+  default_window_height: 720
+
+classification:
   mobilenet:
     input_size: [224, 224]
     num_classes: 3
@@ -30,13 +46,8 @@ classes:
   - "Park Edilemez"
   - "Park Alani Dolu"
 
-data:
-  raw_dir: "data/raw"
-  processed_dir: "data/processed"
-  annotations_dir: "data/annotations"
-
 output:
-  visualizations: "outputs/visualizations"
-  metrics: "outputs/metrics"
-  videos: "outputs/videos"
-  model_checkpoints: "models/checkpoints"
+  visualizations: "./outputs/visualizations"
+  metrics: "./outputs/metrics"
+  videos: "./outputs/videos"
+  model_checkpoints: "./models/checkpoints"

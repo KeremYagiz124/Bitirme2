@@ -1,8 +1,17 @@
 import sys
+import os
+
+# Add project root to path for proper imports
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 from PyQt5.QtWidgets import QApplication
 from src.ui.main_window import MainWindow
 
-if __name__ == "__main__":
+
+def create_app():
+    """Create and configure the application."""
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 
@@ -29,7 +38,14 @@ if __name__ == "__main__":
     }
     """)
 
+    return app
+
+
+if __name__ == "__main__":
+    app = create_app()
     window = MainWindow()
     window.show()
+
+    sys.exit(app.exec_())
 
     sys.exit(app.exec_())

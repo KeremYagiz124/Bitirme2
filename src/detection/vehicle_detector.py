@@ -2,7 +2,6 @@
 
 import cv2
 import numpy as np
-from ultralytics import YOLO
 from pathlib import Path
 
 
@@ -12,6 +11,9 @@ VEHICLE_CLASSES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
 
 class VehicleDetector:
     def __init__(self, model_path: str = "yolov8n.pt", conf: float = 0.5, iou: float = 0.45):
+        # Lazy import to avoid loading torch on module import
+        from ultralytics import YOLO
+        
         self.model = YOLO(model_path)
         self.conf = conf
         self.iou = iou

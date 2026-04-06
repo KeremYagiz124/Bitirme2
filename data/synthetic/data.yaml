@@ -1,0 +1,5 @@
+train: data\synthetic\images
+val: data\synthetic\images  # Using same data for both (small dataset)
+
+nc: 4
+names: ['car', 'motorcycle', 'bus', 'truck']

@@ -1,0 +1,36 @@
+# Project Configuration - Template
+# Copy this to config.local.yaml for user-specific settings
+# config.local.yaml will NOT be tracked by git
+
+project:
+  name: "Park Detection AI"
+  version: "0.1.0"
+
+model:
+  yolo:
+    model_size: "yolov8n"  # n/s/m/l/x
+    weights: "yolov8n.pt"
+    cache_dir: "./models/cache"
+    conf_threshold: 0.5
+    iou_threshold: 0.45
+
+data:
+  synthetic_dir: "./data/synthetic"
+  raw_dir: "./data/raw"
+  processed_dir: "./data/processed"
+
+training:
+  epochs: 50
+  batch_size: 16
+  learning_rate: 0.01
+  device: "cpu"  # Change to "cuda" if GPU available
+
+ui:
+  theme: "dark"
+  default_window_width: 1280
+  default_window_height: 720
+  show_debug_info: false
+
+logging:
+  level: "INFO"
+  file: "./logs/app.log"
