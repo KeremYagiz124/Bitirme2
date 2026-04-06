@@ -63,6 +63,50 @@ Açılan pencerede:
 - "📂 Video Yükle" — mp4/avi/mkv seçer
 - "■ Durdur" — durdurur
 
+## Synthetic Veri Üretimi
+
+```bash
+# 1000 sentetik görüntü üret (train/val otomatik ayrılır)
+python scripts/synthetic_data_generator.py --samples 1000
+
+# Daha fazla üret
+python scripts/synthetic_data_generator.py --samples 3000 --output data/synthetic
+```
+
+Çıktı: `data/synthetic/images/train/`, `data/synthetic/images/val/`, `data/synthetic/data.yaml`
+
+## YOLOv8 Fine-Tuning
+
+```bash
+# Synthetic veri ile fine-tune et
+python scripts/fine_tune_yolo.py --data-dir data/synthetic
+
+# Epoch sayısı ve validation ile
+python scripts/fine_tune_yolo.py --data-dir data/synthetic --epochs 30 --validate
+```
+
+Çıktı: `models/fine_tuned/yolov8_fine_tuned/weights/best.pt`
+
+Fine-tuned modeli arayüzde kullanmak için `main_window.py`'de:
+```python
+self.detector = VehicleDetector(model_path="models/fine_tuned/yolov8_fine_tuned/weights/best.pt")
+```
+
+## Model Değerlendirme
+
+```bash
+# Fine-tuned model değerlendir (fine-tuning bittikten sonra)
+python scripts/evaluate_model.py --model models/fine_tuned/yolov8_fine_tuned/weights/best.pt
+
+# COCO baseline karşılaştırma
+python scripts/evaluate_model.py --model yolov8n.pt
+
+# Farklı eşiklerle
+python scripts/evaluate_model.py --model models/fine_tuned/yolov8_fine_tuned/weights/best.pt --conf 0.3 --iou 0.45
+```
+
+Çıktı: Precision, Recall, mAP@0.5, mAP@0.5:0.95, sınıf başına AP değerleri
+
 ## Kurulum
 
 ```bash

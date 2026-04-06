@@ -4,19 +4,30 @@ import cv2
 import numpy as np
 from pathlib import Path
 
+# COCO pretrained model class IDs
+COCO_VEHICLE_CLASSES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
 
-# COCO class IDs for vehicles
-VEHICLE_CLASSES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
+# Fine-tuned model class IDs (0-indexed, synthetic data)
+FINETUNED_VEHICLE_CLASSES = {0: "car", 1: "motorcycle", 2: "bus", 3: "truck"}
 
 
 class VehicleDetector:
     def __init__(self, model_path: str = "yolov8n.pt", conf: float = 0.5, iou: float = 0.45):
-        # Lazy import to avoid loading torch on module import
         from ultralytics import YOLO
-        
-        self.model = YOLO(model_path)
+
+        self.model_path = str(model_path)
+        self.model = YOLO(self.model_path)
         self.conf = conf
         self.iou = iou
+
+        # Fine-tuned modelde class ID'ler 0-indexed, COCO'da değil
+        self._is_finetuned = "fine_tuned" in self.model_path or "finetuned" in self.model_path
+        if self._is_finetuned:
+            self.class_map = FINETUNED_VEHICLE_CLASSES
+            self.filter_classes = list(FINETUNED_VEHICLE_CLASSES.keys())  # [0,1,2,3]
+        else:
+            self.class_map = COCO_VEHICLE_CLASSES
+            self.filter_classes = list(COCO_VEHICLE_CLASSES.keys())  # [2,3,5,7]
 
     def detect(self, frame: np.ndarray) -> list[dict]:
         """
@@ -32,7 +43,7 @@ class VehicleDetector:
             frame,
             conf=self.conf,
             iou=self.iou,
-            classes=list(VEHICLE_CLASSES.keys()),
+            classes=self.filter_classes,
             verbose=False,
         )[0]
 
@@ -43,7 +54,7 @@ class VehicleDetector:
                 "bbox": box.xyxy[0].tolist(),
                 "confidence": float(box.conf[0]),
                 "class_id": class_id,
-                "class_name": VEHICLE_CLASSES.get(class_id, "vehicle"),
+                "class_name": self.class_map.get(class_id, "vehicle"),
             })
 
         return detections

@@ -1,5 +1,6 @@
-train: data\synthetic\images
-val: data\synthetic\images  # Using same data for both (small dataset)
+train: images/train
+val: images/val
 
 nc: 4
 names: ['car', 'motorcycle', 'bus', 'truck']
+# class mapping: 0=car, 1=motorcycle, 2=bus, 3=truck

@@ -89,8 +89,10 @@ class SyntheticDataGenerator:
 
         labels = []
 
-        # Vehicle class mapping (same as in vehicle_detector.py)
+        # Class mapping for fine-tuned model (0-indexed, sequential)
+        # NOT COCO IDs — fine_tune_yolo.py ve vehicle_detector.py bunu bilmeli
         class_mapping = {"car": 0, "motorcycle": 1, "bus": 2, "truck": 3}
+        # 0=car, 1=motorcycle, 2=bus, 3=truck
 
         for _ in range(num_vehicles):
             # Random vehicle type
@@ -121,29 +123,69 @@ class SyntheticDataGenerator:
             f.write('\n'.join(labels))
 
     def generate_dataset(self, num_samples: int = 1000) -> None:
-        """Generate a dataset with specified number of samples."""
+        """Generate a dataset with specified number of samples and train/val split."""
         print(f"Generating {num_samples} synthetic samples...")
 
+        # Train/val split: %80 train, %20 val
+        train_count = int(num_samples * 0.8)
+        indices = list(range(num_samples))
+        random.shuffle(indices)
+        train_indices = set(indices[:train_count])
+
+        train_images = self.images_dir / "train"
+        val_images   = self.images_dir / "val"
+        train_labels = self.labels_dir / "train"
+        val_labels   = self.labels_dir / "val"
+        for d in (train_images, val_images, train_labels, val_labels):
+            d.mkdir(parents=True, exist_ok=True)
+
         for i in range(num_samples):
-            num_vehicles = random.randint(1, 5)  # 1-5 vehicles per image
-            self.generate_sample(i, num_vehicles)
+            split = "train" if i in train_indices else "val"
+            num_vehicles = random.randint(1, 5)
+            self._generate_sample_split(i, num_vehicles, split)
 
             if (i + 1) % 100 == 0:
                 print(f"Generated {i + 1}/{num_samples} samples")
 
         print("Dataset generation complete!")
 
-        # Create data.yaml for YOLO training
-        data_yaml = f"""train: {self.images_dir}
-val: {self.images_dir}  # Using same data for both (small dataset)
+        # Relative paths — YOLO resolves these relative to the yaml file location
+        # This way the project works on any machine without modification
+        data_yaml = (
+            f"train: images/train\n"
+            f"val: images/val\n\n"
+            f"nc: 4\n"
+            f"names: ['car', 'motorcycle', 'bus', 'truck']\n"
+            f"# class mapping: 0=car, 1=motorcycle, 2=bus, 3=truck\n"
+        )
 
-nc: 4
-names: ['car', 'motorcycle', 'bus', 'truck']"""
-
-        with open(self.output_dir / "data.yaml", 'w') as f:
+        yaml_path = self.output_dir / "data.yaml"
+        with open(yaml_path, 'w') as f:
             f.write(data_yaml)
 
-        print(f"Created data.yaml at {self.output_dir / 'data.yaml'}")
+        print(f"Created data.yaml at {yaml_path}")
+
+    def _generate_sample_split(self, sample_id: int, num_vehicles: int, split: str) -> None:
+        """Generate one synthetic image into the correct train/val subfolder."""
+        image = self.generate_background()
+        labels = []
+        class_mapping = {"car": 0, "motorcycle": 1, "bus": 2, "truck": 3}
+
+        for _ in range(num_vehicles):
+            vehicle_type = random.choice(list(VEHICLE_TYPES.keys()))
+            base_w, base_h = VEHICLE_TYPES[vehicle_type]
+            scale = random.uniform(0.8, 1.5)
+            w = int(base_w * scale)
+            h = int(base_h * scale)
+            x = random.randint(0, self.image_size[0] - w)
+            y = random.randint(0, self.image_size[1] - h)
+            bbox = self.draw_vehicle(image, vehicle_type, (x, y), (w, h))
+            labels.append(f"{class_mapping[vehicle_type]} {' '.join(f'{c:.6f}' for c in bbox)}")
+
+        fname = f"synthetic_{sample_id:06d}"
+        cv2.imwrite(str(self.images_dir / split / f"{fname}.jpg"), image)
+        with open(self.labels_dir / split / f"{fname}.txt", 'w') as f:
+            f.write('\n'.join(labels))
 
 def main():
     parser = argparse.ArgumentParser(description="Generate synthetic vehicle detection data")

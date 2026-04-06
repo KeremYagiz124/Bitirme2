@@ -22,9 +22,23 @@ source venv/bin/activate
 ```
 
 ### 1.3 Bağımlılıkları Yükleyin
+
+**GPU olan bilgisayarlar (önerilen):**
+```bash
+pip install torch==2.2.2+cu121 torchvision==0.17.2+cu121 --index-url https://download.pytorch.org/whl/cu121
+pip install -r requirements.txt
+```
+
+**GPU olmayan / CPU:**
 ```bash
 pip install -r requirements.txt
 ```
+
+> **Not:** Kurulum sonrası GPU'nun tanınıp tanınmadığını test et:
+> ```bash
+> python -c "import torch; print(torch.cuda.is_available())"
+> ```
+> `True` dönmesi gerekiyor. `False` dönüyorsa CPU modunda çalışır, sistem yine de çalışır ama daha yavaş olur.
 
 ## 2. Konfigürasyon (Kullanıcı Spesifik)
 

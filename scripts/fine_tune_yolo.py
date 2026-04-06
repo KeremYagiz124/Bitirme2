@@ -31,14 +31,16 @@ def create_data_config(synthetic_data_dir: str, output_path: str = "data.yaml") 
     if not images_dir.exists() or not labels_dir.exists():
         raise FileNotFoundError(f"Images or labels directory not found in {synthetic_data_dir}")
 
+    # Use relative paths so the yaml works on any machine
     data_config = {
-        'train': str(images_dir),
-        'val': str(images_dir),  # Using same data for both (small synthetic dataset)
-        'test': str(images_dir),
+        'train': 'images/train',
+        'val': 'images/val',
         'nc': 4,
         'names': ['car', 'motorcycle', 'bus', 'truck']
     }
 
+    # Write next to the data directory so relative paths resolve correctly
+    output_path = str(data_dir / "data.yaml")
     with open(output_path, 'w') as f:
         yaml.dump(data_config, f, default_flow_style=False)
 
@@ -46,16 +48,19 @@ def create_data_config(synthetic_data_dir: str, output_path: str = "data.yaml") 
     return output_path
 
 def fine_tune_yolo(data_config: str, output_dir: str = "models/fine_tuned",
-                   epochs: int = 50, batch_size: int = 16, img_size: int = 640) -> str:
+                   epochs: int = 50, batch_size: int = 8, img_size: int = 640) -> str:
     """Fine-tune YOLOv8 model on synthetic data."""
+    import torch
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # Load pre-trained YOLOv8 model (nano version for faster training)
+    device = "0" if torch.cuda.is_available() else "cpu"
+
     model = YOLO('yolov8n.pt')
 
     print("Starting YOLOv8 fine-tuning...")
+    print(f"Device: {device}")
     print(f"Data config: {data_config}")
     print(f"Output directory: {output_path}")
     print(f"Training parameters: epochs={epochs}, batch={batch_size}, imgsz={img_size}")
@@ -69,28 +74,33 @@ def fine_tune_yolo(data_config: str, output_dir: str = "models/fine_tuned",
         project=str(output_path),
         name="yolov8_fine_tuned",
         save=True,
-        save_period=10,  # Save every 10 epochs
-        cache=False,  # Disable caching for synthetic data
-        device='cpu',  # Use CPU (change to 'cuda' if GPU available)
-        workers=0,  # Number of workers for data loading
-        patience=10,  # Early stopping patience
+        save_period=10,
+        cache=False,
+        device=device,
+        workers=0,
+        patience=10,
         verbose=True
     )
 
-    # Get the best model path
-    best_model_path = output_path / "yolov8_fine_tuned" / "weights" / "best.pt"
+    # Get the best model path — Ultralytics saves under runs/detect/<project>/<name>/
+    # Try expected path first, then search runs/ directory
+    candidates = [
+        output_path / "yolov8_fine_tuned" / "weights" / "best.pt",
+        output_path / "yolov8_fine_tuned2" / "weights" / "best.pt",
+    ]
 
-    if best_model_path.exists():
-        print(f"Fine-tuning complete! Best model saved at: {best_model_path}")
-        return str(best_model_path)
-    else:
-        # Fallback to last model
-        last_model_path = output_path / "yolov8_fine_tuned" / "weights" / "last.pt"
-        if last_model_path.exists():
-            print(f"Fine-tuning complete! Model saved at: {last_model_path}")
-            return str(last_model_path)
-        else:
-            raise FileNotFoundError("No trained model found!")
+    # Also search inside runs/detect/
+    runs_dir = Path("runs/detect")
+    if runs_dir.exists():
+        for p in sorted(runs_dir.rglob("best.pt")):
+            candidates.append(p)
+
+    for candidate in candidates:
+        if candidate.exists():
+            print(f"Fine-tuning complete! Best model saved at: {candidate}")
+            return str(candidate)
+
+    raise FileNotFoundError("No trained model found! Check runs/detect/ directory.")
 
 def validate_model(model_path: str, data_config: str) -> None:
     """Validate the fine-tuned model."""
