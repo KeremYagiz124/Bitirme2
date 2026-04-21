@@ -27,13 +27,13 @@ python scripts/baseline_test.py --source data/raw/resim.jpg --conf 0.3
 
 ```bash
 # Yeni etiketleme başlat
-python scripts/annotate_zones.py --image data/raw/otopark.jpg
+python scripts/annotate_zones.py --image data/raw/araba1.jpeg
 
 # Kaydedilen dosyayı düzenlemeye devam et
-python scripts/annotate_zones.py --image data/raw/otopark.jpg --load data/raw/otopark.json
+python scripts/annotate_zones.py --image data/raw/araba1.jpeg --load data/raw/araba1.json
 
 # Çıktıyı farklı konuma kaydet
-python scripts/annotate_zones.py --image data/raw/otopark.jpg --output data/annotations/lot1.json
+python scripts/annotate_zones.py --image data/raw/araba1.jpeg --output data/annotations/lot1.json
 ```
 
 ### Kontroller (pencere açıkken)
@@ -51,6 +51,33 @@ python scripts/annotate_zones.py --image data/raw/otopark.jpg --output data/anno
 
 ---
 
+## Park Analizi — IoU Pipeline (CLI)
+
+```bash
+# Resim üzerinde analiz
+python scripts/run_parking.py --source data/raw/araba1.jpeg --zones data/raw/araba1.json
+
+# Resim analizi + çıktıyı kaydet (outputs/parking/)
+python scripts/run_parking.py --source data/raw/araba1.jpeg --zones data/raw/araba1.json --save
+
+# Video üzerinde analiz
+python scripts/run_parking.py --source data/raw/video.mp4 --zones data/raw/araba1.json
+
+# Video analizi + kaydet
+python scripts/run_parking.py --source data/raw/video.mp4 --zones data/raw/araba1.json --save
+
+# Webcam ile canlı analiz
+python scripts/run_parking.py --source 0 --zones data/raw/araba1.json
+
+# IoU eşiği ve confidence ayarla
+python scripts/run_parking.py --source data/raw/araba1.jpeg --zones data/raw/araba1.json --conf 0.4 --iou-thresh 0.3
+```
+
+Çıktı: Terminalde Boş/Dolu/Yasak özeti + pencerede görselleştirme
+`--save` ile: `outputs/parking/<dosyaadi>`
+
+---
+
 ## Arayüz (GUI)
 
 ```bash
@@ -59,9 +86,13 @@ python -m src.main
 ```
 
 Açılan pencerede:
-- "▶ Kamera" — webcam başlatır
+- "▶ Kamera Başlat" — webcam başlatır
 - "📂 Video Yükle" — mp4/avi/mkv seçer
+- "🖼 Resim Yükle" — jpg/png/bmp seçer
+- "📍 Zone Yükle" — zone JSON yükler (park analizi için)
 - "■ Durdur" — durdurur
+
+Zone yüklendikten sonra park slot durumu (Boş/Dolu/Yasak) otomatik gösterilir.
 
 ## Synthetic Veri Üretimi
 
@@ -107,8 +138,22 @@ python scripts/evaluate_model.py --model models/fine_tuned/yolov8_fine_tuned/wei
 
 Çıktı: Precision, Recall, mAP@0.5, mAP@0.5:0.95, sınıf başına AP değerleri
 
+## Testler
+
+```bash
+# Tüm testleri çalıştır
+python -m pytest tests/ -v
+
+# Sadece parking analyzer testleri
+python -m pytest tests/test_parking_analyzer.py -v
+
+# Sadece zone loader testleri
+python -m pytest tests/test_zone_loader.py -v
+```
+
 ## Kurulum
 
 ```bash
 pip install -r requirements.txt
+pip install pytest
 ```

@@ -1,13 +1,19 @@
+import csv
 import time
+from datetime import datetime
+from pathlib import Path
+
 import cv2
 from PyQt5.QtWidgets import (
     QWidget, QLabel, QPushButton, QVBoxLayout,
-    QHBoxLayout, QFrame, QFileDialog, QGridLayout
+    QHBoxLayout, QFrame, QFileDialog, QGridLayout, QMessageBox, QSlider
 )
 from PyQt5.QtGui import QImage, QPixmap, QFont
 from PyQt5.QtCore import QTimer, Qt
 
 from src.detection.vehicle_detector import VehicleDetector
+from src.parking import ZoneLoader, ParkingAnalyzer
+from src.parking import STATUS_AVAILABLE, STATUS_OCCUPIED, STATUS_FORBIDDEN
 
 VEHICLE_CLASSES = {2: "Araba", 3: "Motosiklet", 5: "Otobüs", 7: "Kamyon"}
 VEHICLE_COLORS_CV = {
@@ -64,19 +70,32 @@ class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Smart Parking AI")
-        self.setGeometry(100, 100, 1400, 820)
+        self.setGeometry(100, 100, 1400, 860)
         self.setMinimumSize(1100, 700)
 
         self.detector = None
         self.cap = None
         self._last_time = time.time()
         self._fps = 0.0
+        self.analyzer = None
+        self._last_frame = None
+        self._rgb_buf = None
+
+        # Threshold değerleri
+        self._conf_thresh = 0.50
+        self._iou_thresh  = 0.25
+
+        # Loglama
+        self._log_file = None
+        self._log_writer = None
+        self._logging = False
+        self._frame_count = 0
 
         self._build_ui()
         self._load_model()
 
+    # ── UI ────────────────────────────────────────────────────────
     def _build_ui(self):
-        # ── Video alanı ──────────────────────────────────────────
         self.video_label = QLabel("Video / Kamera Bekleniyor")
         self.video_label.setAlignment(Qt.AlignCenter)
         self.video_label.setStyleSheet("""
@@ -87,41 +106,72 @@ class MainWindow(QWidget):
         """)
         self.video_label.setMinimumSize(860, 640)
 
-        # ── Sağ panel ─────────────────────────────────────────────
         panel = QVBoxLayout()
         panel.setSpacing(8)
         panel.setContentsMargins(12, 16, 12, 16)
 
-        # Başlık
         title = QLabel("Smart Parking AI")
         title.setFont(QFont("Arial", 14, QFont.Bold))
         title.setStyleSheet("color: #3b82f6;")
         title.setAlignment(Qt.AlignCenter)
         panel.addWidget(title)
 
-        subtitle = QLabel("YOLOv8 · Araç Tespiti")
+        subtitle = QLabel("YOLOv8 · IoU Pipeline")
         subtitle.setStyleSheet("color: #64748b; font-size: 10px;")
         subtitle.setAlignment(Qt.AlignCenter)
         panel.addWidget(subtitle)
 
-        # Kontroller
+        # ── Kontroller ──
         panel.addWidget(make_section_label("KONTROL"))
 
-        self.start_btn = self._btn("▶  Kamera Başlat", "#2563eb")
-        self.stop_btn  = self._btn("■  Durdur",        "#dc2626")
-        self.img_btn   = self._btn("🖼  Resim Yükle",   "#7c3aed")
-        self.vid_btn   = self._btn("📂  Video Yükle",   "#0891b2")
+        self.start_btn    = self._btn("▶  Kamera Başlat", "#2563eb")
+        self.stop_btn     = self._btn("■  Durdur",        "#dc2626")
+        self.img_btn      = self._btn("🖼  Resim Yükle",   "#7c3aed")
+        self.vid_btn      = self._btn("📂  Video Yükle",   "#0891b2")
+        self.zone_btn     = self._btn("📍  Zone Tanımla",  "#059669")
+        self.snapshot_btn = self._btn("📸  Snapshot Al",   "#b45309")
+        self.log_btn      = self._btn("⏺  Loglama Başlat","#0f766e")
 
         self.stop_btn.setEnabled(False)
         self.start_btn.clicked.connect(self.start_camera)
         self.stop_btn.clicked.connect(self.stop_feed)
         self.img_btn.clicked.connect(self.load_image)
         self.vid_btn.clicked.connect(self.load_video)
+        self.zone_btn.clicked.connect(self.load_zones_from_image)
+        self.snapshot_btn.clicked.connect(self.take_snapshot)
+        self.log_btn.clicked.connect(self.toggle_logging)
 
-        for b in (self.start_btn, self.stop_btn, self.img_btn, self.vid_btn):
+        for b in (self.start_btn, self.stop_btn, self.img_btn,
+                  self.vid_btn, self.zone_btn, self.snapshot_btn, self.log_btn):
             panel.addWidget(b)
 
-        # İstatistikler
+        self.zone_lbl = QLabel("Zone: yüklenmedi")
+        self.zone_lbl.setStyleSheet("color: #64748b; font-size: 10px;")
+        self.zone_lbl.setWordWrap(True)
+        panel.addWidget(self.zone_lbl)
+
+        # ── Sliderlar ──
+        panel.addWidget(make_section_label("AYARLAR"))
+
+        conf_desc = QLabel("Tespit hassasiyeti — dusuk: cok tespit, yuksek: emin ol")
+        conf_desc.setStyleSheet("color: #475569; font-size: 9px;")
+        conf_desc.setWordWrap(True)
+        panel.addWidget(conf_desc)
+        panel.addLayout(self._slider_row(
+            "Conf:", 10, 95, int(self._conf_thresh * 100),
+            lambda v: self._set_conf(v)
+        ))
+
+        iou_desc = QLabel("Zone ortusme esigi — dusuk: az ortusme yeter, yuksek: tam ortusme")
+        iou_desc.setStyleSheet("color: #475569; font-size: 9px;")
+        iou_desc.setWordWrap(True)
+        panel.addWidget(iou_desc)
+        panel.addLayout(self._slider_row(
+            "IoU:", 5, 80, int(self._iou_thresh * 100),
+            lambda v: self._set_iou(v)
+        ))
+
+        # ── Tespit ──
         panel.addWidget(make_section_label("TESPİT"))
 
         self.stat_cards = {}
@@ -134,7 +184,21 @@ class MainWindow(QWidget):
             grid.addWidget(card, i // 2, i % 2)
         panel.addLayout(grid)
 
-        # Durum
+        # ── Park Durumu ──
+        panel.addWidget(make_section_label("PARK DURUMU"))
+
+        park_grid = QGridLayout()
+        park_grid.setSpacing(6)
+        self.park_cards = {
+            STATUS_AVAILABLE: StatCard("🟢", "Bos Slot",  "#00dc50"),
+            STATUS_OCCUPIED:  StatCard("🔴", "Dolu Slot", "#3c3cdc"),
+            STATUS_FORBIDDEN: StatCard("⚠️",  "Yasak",    "#c82020"),
+        }
+        for i, card in enumerate(self.park_cards.values()):
+            park_grid.addWidget(card, 0, i)
+        panel.addLayout(park_grid)
+
+        # ── Durum ──
         panel.addWidget(make_section_label("DURUM"))
 
         self.status_lbl = QLabel("Hazır")
@@ -153,7 +217,6 @@ class MainWindow(QWidget):
         panel_frame.setStyleSheet("background-color: #0f172a; border-radius: 12px;")
         panel_frame.setLayout(panel)
 
-        # ── Ana layout ────────────────────────────────────────────
         root = QHBoxLayout()
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(12)
@@ -161,7 +224,6 @@ class MainWindow(QWidget):
         root.addWidget(panel_frame)
         self.setLayout(root)
 
-        # Timer
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_frame)
 
@@ -181,16 +243,206 @@ class MainWindow(QWidget):
         """)
         return b
 
+    def _slider_row(self, label_text: str, lo: int, hi: int,
+                    init: int, callback) -> QHBoxLayout:
+        row = QHBoxLayout()
+        lbl = QLabel(label_text)
+        lbl.setFixedWidth(32)
+        lbl.setStyleSheet("color: #e2e8f0; font-size: 10px; font-weight: bold;")
+
+        slider = QSlider(Qt.Horizontal)
+        slider.setRange(lo, hi)
+        slider.setValue(init)
+        slider.setFixedHeight(18)
+
+        val_lbl = QLabel(f"{init/100:.2f}")
+        val_lbl.setFixedWidth(34)
+        val_lbl.setStyleSheet("color: #e2e8f0; font-size: 10px;")
+
+        def on_change(v):
+            val_lbl.setText(f"{v/100:.2f}")
+            callback(v)
+
+        slider.valueChanged.connect(on_change)
+        row.addWidget(lbl)
+        row.addWidget(slider)
+        row.addWidget(val_lbl)
+        return row
+
+    def _set_conf(self, v: int):
+        self._conf_thresh = v / 100
+        if self.detector:
+            self.detector.conf = self._conf_thresh
+        if self._last_frame is not None:
+            self._process_and_show(self._last_frame)
+
+    def _set_iou(self, v: int):
+        self._iou_thresh = v / 100
+        if self.analyzer:
+            self.analyzer.iou_threshold = self._iou_thresh
+        if self._last_frame is not None:
+            self._process_and_show(self._last_frame)
+
     # ── Model ─────────────────────────────────────────────────────
     def _load_model(self):
         self.status_lbl.setText("Model yükleniyor...")
         try:
-            self.detector = VehicleDetector()
+            self.detector = VehicleDetector(conf=self._conf_thresh)
             self.status_lbl.setText("Model yüklendi.")
         except Exception as e:
             self.status_lbl.setText(f"Model hatası:\n{e}")
 
+    # ── Snapshot ──────────────────────────────────────────────────
+    def take_snapshot(self):
+        if self._last_frame is None:
+            self.status_lbl.setText("Snapshot: görüntü yok.")
+            return
+        out_dir = Path("outputs/snapshots")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        img_path = out_dir / f"snapshot_{ts}.jpg"
+        # Analiz edilmiş frame'i kaydet
+        frame = self._last_frame.copy()
+        if self.analyzer:
+            from src.detection.vehicle_detector import VehicleDetector as _VD
+            dets = self.detector.detect(frame) if self.detector else []
+            result = self.analyzer.analyze(dets)
+            frame = self.analyzer.draw(frame, result, dets)
+        cv2.imwrite(str(img_path), frame)
+        self.status_lbl.setText(f"Snapshot: {img_path.name}")
+
+    # ── Loglama ───────────────────────────────────────────────────
+    def toggle_logging(self):
+        if not self._logging:
+            out_dir = Path("outputs/metrics")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_path = out_dir / f"log_{ts}.csv"
+            self._log_file = open(log_path, "w", newline="", encoding="utf-8")
+            self._log_writer = csv.writer(self._log_file)
+            self._log_writer.writerow([
+                "frame", "timestamp", "vehicles",
+                "available", "occupied", "forbidden_vehicles"
+            ])
+            self._frame_count = 0
+            self._logging = True
+            self.log_btn.setText("⏹  Loglama Durdur")
+            self.log_btn.setStyleSheet(self.log_btn.styleSheet().replace("#0f766e", "#dc2626"))
+            self.status_lbl.setText(f"Log: {log_path.name}")
+        else:
+            self._stop_logging()
+
+    def _stop_logging(self):
+        if self._log_file:
+            self._log_file.close()
+            self._log_file = None
+            self._log_writer = None
+        self._logging = False
+        self.log_btn.setText("⏺  Loglama Başlat")
+        self.log_btn.setStyleSheet(self.log_btn.styleSheet().replace("#dc2626", "#0f766e"))
+        self.status_lbl.setText("Loglama durduruldu.")
+
+    def _log_frame(self, vehicle_count: int, available: int,
+                   occupied: int, forbidden: int):
+        if not self._logging or self._log_writer is None:
+            return
+        self._frame_count += 1
+        self._log_writer.writerow([
+            self._frame_count,
+            datetime.now().strftime("%H:%M:%S.%f")[:-3],
+            vehicle_count, available, occupied, forbidden
+        ])
+
+    # ── Zone yükleme ──────────────────────────────────────────────
+    def _try_load_json(self, json_path: str) -> bool:
+        try:
+            loader = ZoneLoader(json_path)
+            self.analyzer = ParkingAnalyzer(loader,
+                                            iou_threshold=self._iou_thresh)
+            n_park = len(loader.parking_zones)
+            n_forb = len(loader.forbidden_zones)
+            self.zone_lbl.setText(
+                f"Zone: {Path(json_path).name}\n"
+                f"{n_park} park · {n_forb} yasak"
+            )
+            self.status_lbl.setText(f"Zone yüklendi: {n_park + n_forb} bölge")
+            return True
+        except Exception as e:
+            self.status_lbl.setText(f"Zone hatası:\n{e}")
+            return False
+
+    def load_zones_from_image(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Zone için Resim Seç", "data/",
+            "Resim (*.jpg *.jpeg *.png *.bmp)"
+        )
+        if not path:
+            return
+
+        json_path = str(Path(path).with_suffix(".json"))
+
+        if Path(json_path).exists():
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Zone Mevcut")
+            msg.setText(f"{Path(json_path).name} zaten var.\nNe yapmak istersiniz?")
+            btn_load = msg.addButton("Yükle", QMessageBox.AcceptRole)
+            msg.addButton("Düzenle", QMessageBox.RejectRole)
+            msg.exec_()
+            if msg.clickedButton() == btn_load:
+                if self._try_load_json(json_path):
+                    ref = cv2.imread(path)
+                    if ref is not None:
+                        self._process_and_show(ref)
+                return
+
+        reply = QMessageBox.question(
+            self, "Zone Bulunamadı",
+            f"{Path(json_path).name} bulunamadı.\n"
+            "Zone çizmek için annotator açılsın mı?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        try:
+            from src.parking.zone_annotator import ZoneAnnotator
+            load_existing = json_path if Path(json_path).exists() else None
+            annotator = ZoneAnnotator(path, output_path=json_path,
+                                      load_path=load_existing)
+            annotator.run()
+        except Exception as e:
+            self.status_lbl.setText(f"Annotator hatası:\n{e}")
+            return
+
+        if Path(json_path).exists():
+            if self._try_load_json(json_path):
+                ref = cv2.imread(path)
+                if ref is not None:
+                    self._process_and_show(ref)
+        else:
+            self.status_lbl.setText("Zone kaydedilmedi.")
+
+    def _refresh_current_frame(self):
+        if self._last_frame is not None:
+            self._process_and_show(self._last_frame)
+
     # ── Feed yönetimi ─────────────────────────────────────────────
+    def _clear_zones(self):
+        self.analyzer = None
+        self.zone_lbl.setText("Zone: yüklenmedi")
+        for card in self.park_cards.values():
+            card.set_count(0)
+
+    def _auto_load_zones(self, source_path: str):
+        json_path = str(Path(source_path).with_suffix(".json"))
+        if Path(json_path).exists():
+            if self._try_load_json(json_path):
+                self.status_lbl.setText(
+                    f"Zone otomatik yüklendi: {Path(json_path).name}"
+                )
+        else:
+            self._clear_zones()
+
     def _start_feed(self):
         self._last_time = time.time()
         self.stop_btn.setEnabled(True)
@@ -222,6 +474,7 @@ class MainWindow(QWidget):
             self.cap = None
             return
         self.status_lbl.setText("Video oynatılıyor.")
+        self._auto_load_zones(path)
         self._start_feed()
 
     def load_image(self):
@@ -235,6 +488,7 @@ class MainWindow(QWidget):
         if frame is None:
             self.status_lbl.setText("Resim açılamadı.")
             return
+        self._auto_load_zones(path)
         self._process_and_show(frame)
         self.status_lbl.setText("Resim yüklendi.")
 
@@ -250,6 +504,10 @@ class MainWindow(QWidget):
         self.fps_lbl.setText("FPS: —")
         self.status_lbl.setText("Durduruldu.")
 
+    def closeEvent(self, event):
+        self._stop_logging()
+        super().closeEvent(event)
+
     # ── Frame işleme ──────────────────────────────────────────────
     def update_frame(self):
         if self.cap is None:
@@ -262,25 +520,42 @@ class MainWindow(QWidget):
 
         self._process_and_show(frame)
 
-        # FPS
         now = time.time()
         self._fps = 0.9 * self._fps + 0.1 * (1.0 / max(now - self._last_time, 1e-6))
         self._last_time = now
         self.fps_lbl.setText(f"FPS: {self._fps:.1f}")
 
     def _process_and_show(self, frame):
+        self._last_frame = frame.copy()
         counts = {cls_id: 0 for cls_id in VEHICLE_CLASSES}
+        detections = []
 
         if self.detector:
             detections = self.detector.detect(frame)
             for det in detections:
                 cls_id = det.get("class_id")
+                if cls_id in VEHICLE_CLASSES:
+                    counts[cls_id] += 1
+
+        available = occupied = forbidden = 0
+
+        if self.analyzer:
+            result = self.analyzer.analyze(detections)
+            frame = self.analyzer.draw(frame, result, detections)
+            available = result.available
+            occupied  = result.occupied
+            forbidden = result.forbidden_vehicles
+            self.park_cards[STATUS_AVAILABLE].set_count(available)
+            self.park_cards[STATUS_OCCUPIED].set_count(occupied)
+            self.park_cards[STATUS_FORBIDDEN].set_count(forbidden)
+        else:
+            for det in detections:
+                cls_id = det.get("class_id")
                 if cls_id not in VEHICLE_CLASSES:
                     continue
-                counts[cls_id] += 1
                 x1, y1, x2, y2 = map(int, det["bbox"])
                 conf = det["confidence"]
-                color = VEHICLE_COLORS_CV[cls_id]
+                color = VEHICLE_COLORS_CV.get(cls_id, (0, 255, 0))
                 label = f"{VEHICLE_CLASSES[cls_id]} {conf:.2f}"
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
                 cv2.putText(frame, label, (x1, y1 - 8),
@@ -289,9 +564,11 @@ class MainWindow(QWidget):
         for cls_id, card in self.stat_cards.items():
             card.set_count(counts[cls_id])
 
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb.shape
-        img = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
+        self._log_frame(sum(counts.values()), available, occupied, forbidden)
+
+        self._rgb_buf = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = self._rgb_buf.shape
+        img = QImage(self._rgb_buf.data, w, h, ch * w, QImage.Format_RGB888)
         self.video_label.setPixmap(
             QPixmap.fromImage(img).scaled(
                 self.video_label.width(),

@@ -2,92 +2,57 @@
 
 ## 6.1 Genel Değerlendirme
 
-Bu projede kamera görüntülerinden araç tespiti ve park uygunluğu analizi yapan bir yapay zeka sistemi geliştirilmesi hedeflenmiş; ilk iki haftada kurulan temel, projenin geri kalanı için sağlam bir zemin oluşturmuştur.
+Bu projede kamera görüntülerinden araç tespiti ve park uygunluğu analizi yapan yapay zeka tabanlı bir sistem geliştirilmesi hedeflenmiştir. İlk iki haftada gerçekleştirilen çalışmalar şu şekilde özetlenebilir:
 
-Şu ana kadar gerçekleştirilen çalışmalar şu şekilde özetlenebilir:
+- YOLOv8 tabanlı araç tespit sistemi çalışır duruma getirilmiştir.
+- Park alanı etiketleme aracı (ZoneAnnotator) tamamlanmıştır.
+- IoU tabanlı doluluk analizi altyapısı hazırlanmıştır.
+- 1000 görüntülük sentetik veri üretilmiş ve fine-tuning tamamlanmıştır (mAP@0.5: %99.5).
+- PyQt5 arayüzü tamamlanmış; kamera, video ve resim üzerinde gerçek zamanlı analiz yapılabilmektedir.
 
-- YOLOv8 tabanlı araç tespit sistemi çalışır duruma getirilmiştir. Model araba, otobüs, kamyon ve motosikleti gerçek zamanlı olarak tespit etmektedir.
-- Park alanı etiketleme aracı tamamlanmıştır. Herhangi bir park alanı fotoğrafı üzerinde poligon çizilerek park ve yasak bölgeler tanımlanabilmektedir.
-- IoU tabanlı doluluk analizi için altyapı hazırlanmıştır. Araç bounding box ile park poligonu arasındaki örtüşme hesaplanabilmektedir.
-- Sentetik veri üreteci yazılmış ve 1000 görüntü üretilmiştir. Veriler %80 eğitim, %20 doğrulama olarak ayrılmıştır.
-- Fine-tuning altyapısı hazırlanmıştır. YOLOv8'i üretilen veriyle yeniden eğitme betiği çalışır durumdadır.
-- PyQt5 arayüzü tamamlanmıştır. Kamera, video ve resim üzerinde gerçek zamanlı analiz gerçekleştirilebilmektedir.
-
-Başlangıçta belirlenen hipotez hatırlandığında — "YOLOv8 ile poligon tabanlı park analizinin birleştirilmesi, park uygunluğunu üç sınıfta %85 ve üzeri doğrulukla sınıflandırmak için yeterlidir" — bu hipotez henüz tam olarak test edilememiştir. Ancak kurulan altyapı bu testi gerçekleştirmeyi mümkün kılmaktadır.
+Başlangıçta belirlenen hipotez — "YOLOv8 ile poligon tabanlı park analizinin birleştirilmesi, park uygunluğunu üç sınıfta %85 ve üzeri doğrulukla sınıflandırmak için yeterlidir" — henüz tam olarak test edilememiştir. Kurulan altyapı bu testi mümkün kılmaktadır.
 
 ---
 
 ## 6.2 Literatürle Karşılaştırma
 
-Gerçekleştirilen çalışmalar literatürdeki benzer çalışmalarla kıyaslandığında şu tablo ortaya çıkmaktadır:
+2017'deki mAlexNet [3] ve 2019'daki CarNet [4] gibi çalışmalara kıyasla çok daha güncel bir model (YOLOv8) kullanılmaktadır. Söz konusu çalışmalar yalnızca "dolu/boş" kararı üretirken geliştirilen projede "yasak bölge" sınıfı da eklenmiştir.
 
-Geliştirilen sistem, 2017'deki mAlexNet [3] ve 2019'daki CarNet [4] gibi çalışmalara kıyasla çok daha güncel bir model (YOLOv8) kullanmaktadır. Söz konusu çalışmalarda yalnızca "dolu/boş" kararı üretilirken bu projede "yasak bölge ihlali" sınıfı da eklenmiştir.
-
-da Luz vd.'nin 2024 çalışması [7] mevcut projeye en yakın referans niteliğindedir. Bu çalışmada da YOLOv8 ile ROI analizi bir arada kullanılmaktadır. Geliştirilen sistemdeki fark, yasak bölge tespiti ve üç sınıflı karar motorunun eklenmesidir.
-
-Parquery [11] gibi ticari sistemlerle aynı felsefe paylaşılmaktadır: mevcut kameraya yapay zeka ekle, ek altyapı gerektirme.
+da Luz vd.'nin 2024 çalışması [7] mevcut projeye en yakın referanstır; YOLOv8 + ROI analizi kombinasyonu büyük ölçüde örtüşmektedir. Ticari tarafta ise Parquery [11] ile aynı felsefe paylaşılmaktadır: mevcut kameraya yapay zeka ekle, ek altyapı gerektirme.
 
 ---
 
 ## 6.3 Karşılaşılan Zorluklar
 
-Proje boyunca aşağıdaki teknik sorunlarla karşılaşılmıştır:
+**PyTorch/NumPy sürüm uyumsuzluğu:** PyTorch 2.10 kurulduğunda DLL hatası alınmıştır. PyTorch 2.2.2 ve NumPy 1.26.4 kombinasyonuna geçilerek sorun giderilmiştir.
 
-**PyTorch ve NumPy sürüm uyumsuzluğu:** PyTorch 2.10 kurulduğunda DLL hatası alınmıştır. NumPy 2.x ile PyTorch 2.2.x sürümleri çakışmıştır. PyTorch 2.2.2 ve NumPy 1.26.4 kombinasyonuna geçilerek sorun giderilmiştir.
+**GPU kullanılamaması:** Başlangıçta sürücü uyumsuzluğu nedeniyle CPU kullanılmıştır. CUDA 12.1 destekli PyTorch kurulumunun ardından GPU aktif hale getirilmiştir.
 
-**GPU kullanılamaması:** Başlangıçta sürücü uyumsuzluğu nedeniyle GPU yerine CPU kullanılmıştır. CUDA 12.1 destekli PyTorch kurulumunun ardından GPU aktif hale getirilmiştir.
+**Class ID uyumsuzluğu:** COCO modelinde araç ID'leri 2, 3, 5, 7 iken fine-tuned modelde 0, 1, 2, 3'tür. VehicleDetector'a model adına göre otomatik seçim eklenerek sorun çözülmüştür.
 
-**Class ID uyumsuzluğu:** COCO modelinde araç class ID'leri 2, 3, 5, 7 iken sentetik veriyle eğitilen modelde 0, 1, 2, 3 olarak belirlenmiştir. Bu durum, fine-tuned modelin hiçbir şey tespit edememesine yol açabilecekti. VehicleDetector sınıfına model adına göre otomatik seçim eklenerek sorun çözülmüştür.
-
-**Timer çoklu bağlantı:** Arayüzde kamera ve video butonları her tıklamada timer'a yeni bir bağlantı ekliyordu. Bu durum her karede işlemin katlanarak çalışmasına neden olmaktaydı. Timer başta bir kez bağlanacak şekilde yeniden düzenlenmiştir.
+**Timer çoklu bağlantı:** Arayüzde her buton tıklamasında timer'a yeni bağlantı eklenmekteydi. Timer başta bir kez bağlanacak şekilde yeniden düzenlenmiştir.
 
 ---
 
 ## 6.4 Gelecek Çalışmalar
 
-Projenin önümüzdeki haftalarında yapılması planlanan geliştirmeler aşağıda sıralanmıştır:
-
 **Yakın vadeli (Hafta 3-4):**
-- IoU pipeline'ı arayüze tam entegre edilecektir. Şu an araç tespiti görselleştirilmekte ancak park alanı kararı ekrana yansıtılmamaktadır.
-- Kural tabanlı karar motoru yazılacak ve üç sınıflı çıktı üretilecektir.
-- Okul otoparkından gerçek kamera görüntüsü çekilip sistem test edilecektir.
-- PKLot veri seti [8] indirilerek baseline karşılaştırması gerçekleştirilecektir.
+- IoU pipeline arayüze entegre edilecektir.
+- Üç sınıflı çıktı ekrana yansıtılacaktır.
+- Gerçek kamera görüntüleriyle sistem test edilecektir.
+- PKLot veri seti [8] ile baseline karşılaştırması gerçekleştirilecektir.
 
 **Orta vadeli (Hafta 5-6):**
 - MobileNetV2 [6] ikinci doğrulama katmanı eklenecektir.
-- Ablasyon çalışması kapsamında "Yalnızca IoU" ile "IoU + MobileNetV2" karşılaştırılacaktır.
-- Confusion matrix, F1-Score, mAP metrikleri hesaplanacaktır.
-- Veri artırma teknikleri uygulanacaktır: parlaklık değişimi, bulanıklaştırma, döndürme.
+- Ablasyon çalışması yapılacaktır: "Yalnızca IoU" ile "IoU + MobileNetV2" karşılaştırılacaktır.
+- Confusion matrix, F1-Score ve mAP metrikleri hesaplanacaktır.
+- Veri artırma teknikleri uygulanacaktır.
 
 **İleri vadeli (Hafta 7-8):**
-- ByteTrack [10] araç takibi entegre edilecektir. Geçen araç ile park edilmiş araç ayırt edilebilecektir.
+- ByteTrack [10] araç takibi entegre edilecektir.
 - FPS ve gecikme ölçümleri gerçekleştirilecektir.
 - Farklı kamera açılarında sistem test edilecektir.
 - Final demo videosu hazırlanacaktır.
-
----
-
-## 6.5 Projenin Potansiyeli
-
-Bu proje akademik bir çalışma olarak başlamıştır; ancak benzer sistemlerin ticari hayata geçtiği görülmektedir. Parquery [11], Quercus [12] gibi şirketler aynı fikri milyarlarca dolarlık bir pazara dönüştürmüştür.
-
-Geliştirilen sistem şu an sınırlı bir donanımda çalışmakta ve birkaç eksikliği bulunmaktadır. Ancak temel mimari doğru kurulmuştur: mevcut kamera + yapay zeka + yazılım. Bu üçlü, zeminde sensör kazımadan, yüksek altyapı maliyeti olmadan akıllı park yönetiminin gerçekleştirilebileceğini göstermektedir.
-
-İleride bu sistem Jetson Nano gibi düşük güçlü bir edge cihaza taşınabilir, birden fazla kamerayla çalışacak şekilde genişletilebilir ve gerçek zamanlı uyarı sistemiyle entegre edilebilir.
-
----
-
-## 6.6 Özet
-
-Bu raporda aşağıdaki konular ele alınmıştır:
-
-- Kentsel park sorunu ve mevcut çözümlerin yetersizlikleri tanımlanmıştır.
-- Literatürdeki akademik çalışmalar ve ticari sistemler incelenmiş, projenin bu ekosistem içindeki yeri belirlenmiştir.
-- Sistemin mimarisi, bileşenleri ve bunların birbirleriyle nasıl çalıştığı açıklanmıştır.
-- Kullanılan teknolojiler ve seçim gerekçeleri ortaya konmuştur.
-- Şimdiye kadar gerçekleştirilen çalışmalar ve elde edilen ilk sonuçlar paylaşılmıştır.
-
-Proje hâlâ devam etmektedir. Önümüzdeki haftalarda IoU pipeline entegrasyonu, gerçek kamera testi ve model metriklerinin ölçülmesi öncelikli hedefler arasında yer almaktadır.
 
 ---
 
