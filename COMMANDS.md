@@ -151,9 +151,32 @@ python -m pytest tests/test_parking_analyzer.py -v
 python -m pytest tests/test_zone_loader.py -v
 ```
 
+## Ground Truth Karşılaştırma
+
+Zone JSON'una her park slotuna `"expected": "occupied"` veya `"expected": "available"` ekle, sonra:
+
+```bash
+python scripts/compare_ground_truth.py --image data/raw/araba1.jpeg --zones data/raw/araba1.json
+python scripts/compare_ground_truth.py --image data/raw/araba1.jpeg --zones data/raw/araba1.json --conf 0.4 --iou-thresh 0.3
+```
+
+Çıktı: Zone bazında beklenen/tahmin edilen durum tablosu + accuracy yüzdesi
+
+---
+
+## CSV Log Grafiği
+
+```bash
+# Grafiği ekranda göster
+python scripts/plot_log.py --log outputs/metrics/log_20260421_155805.csv
+
+# PNG olarak kaydet (outputs/metrics/<isim>_plot.png)
+python scripts/plot_log.py --log outputs/metrics/log_20260421_155805.csv --save
+```
+
+
 ## Kurulum
 
 ```bash
 pip install -r requirements.txt
-pip install pytest
 ```

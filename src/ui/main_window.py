@@ -81,11 +81,9 @@ class MainWindow(QWidget):
         self._last_frame = None
         self._rgb_buf = None
 
-        # Threshold değerleri
         self._conf_thresh = 0.50
         self._iou_thresh  = 0.25
 
-        # Loglama
         self._log_file = None
         self._log_writer = None
         self._logging = False
@@ -198,6 +196,15 @@ class MainWindow(QWidget):
             park_grid.addWidget(card, 0, i)
         panel.addLayout(park_grid)
 
+        # Doluluk oranı
+        self.occupancy_lbl = QLabel("")
+        self.occupancy_lbl.setStyleSheet(
+            "color: #f1f5f9; font-size: 12px; font-weight: bold;"
+            "background: #1e293b; border-radius: 6px; padding: 4px 8px;"
+        )
+        self.occupancy_lbl.setAlignment(Qt.AlignCenter)
+        panel.addWidget(self.occupancy_lbl)
+
         # ── Durum ──
         panel.addWidget(make_section_label("DURUM"))
 
@@ -243,8 +250,7 @@ class MainWindow(QWidget):
         """)
         return b
 
-    def _slider_row(self, label_text: str, lo: int, hi: int,
-                    init: int, callback) -> QHBoxLayout:
+    def _slider_row(self, label_text, lo, hi, init, callback):
         row = QHBoxLayout()
         lbl = QLabel(label_text)
         lbl.setFixedWidth(32)
@@ -269,18 +275,18 @@ class MainWindow(QWidget):
         row.addWidget(val_lbl)
         return row
 
-    def _set_conf(self, v: int):
+    def _set_conf(self, v):
         self._conf_thresh = v / 100
         if self.detector:
             self.detector.conf = self._conf_thresh
-        if self._last_frame is not None:
+        if self._last_frame is not None and self.cap is None:
             self._process_and_show(self._last_frame)
 
-    def _set_iou(self, v: int):
+    def _set_iou(self, v):
         self._iou_thresh = v / 100
         if self.analyzer:
             self.analyzer.iou_threshold = self._iou_thresh
-        if self._last_frame is not None:
+        if self._last_frame is not None and self.cap is None:
             self._process_and_show(self._last_frame)
 
     # ── Model ─────────────────────────────────────────────────────
@@ -301,11 +307,9 @@ class MainWindow(QWidget):
         out_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         img_path = out_dir / f"snapshot_{ts}.jpg"
-        # Analiz edilmiş frame'i kaydet
         frame = self._last_frame.copy()
-        if self.analyzer:
-            from src.detection.vehicle_detector import VehicleDetector as _VD
-            dets = self.detector.detect(frame) if self.detector else []
+        if self.analyzer and self.detector:
+            dets = self.detector.detect(frame)
             result = self.analyzer.analyze(dets)
             frame = self.analyzer.draw(frame, result, dets)
         cv2.imwrite(str(img_path), frame)
@@ -342,8 +346,7 @@ class MainWindow(QWidget):
         self.log_btn.setStyleSheet(self.log_btn.styleSheet().replace("#dc2626", "#0f766e"))
         self.status_lbl.setText("Loglama durduruldu.")
 
-    def _log_frame(self, vehicle_count: int, available: int,
-                   occupied: int, forbidden: int):
+    def _log_frame(self, vehicle_count, available, occupied, forbidden):
         if not self._logging or self._log_writer is None:
             return
         self._frame_count += 1
@@ -357,8 +360,7 @@ class MainWindow(QWidget):
     def _try_load_json(self, json_path: str) -> bool:
         try:
             loader = ZoneLoader(json_path)
-            self.analyzer = ParkingAnalyzer(loader,
-                                            iou_threshold=self._iou_thresh)
+            self.analyzer = ParkingAnalyzer(loader, iou_threshold=self._iou_thresh)
             n_park = len(loader.parking_zones)
             n_forb = len(loader.forbidden_zones)
             self.zone_lbl.setText(
@@ -378,15 +380,15 @@ class MainWindow(QWidget):
         )
         if not path:
             return
-
         json_path = str(Path(path).with_suffix(".json"))
+        json_exists = Path(json_path).exists()
 
-        if Path(json_path).exists():
+        if json_exists:
             msg = QMessageBox(self)
             msg.setWindowTitle("Zone Mevcut")
             msg.setText(f"{Path(json_path).name} zaten var.\nNe yapmak istersiniz?")
             btn_load = msg.addButton("Yükle", QMessageBox.AcceptRole)
-            msg.addButton("Düzenle", QMessageBox.RejectRole)
+            msg.addButton("Annotator ile Düzenle", QMessageBox.RejectRole)
             msg.exec_()
             if msg.clickedButton() == btn_load:
                 if self._try_load_json(json_path):
@@ -394,55 +396,42 @@ class MainWindow(QWidget):
                     if ref is not None:
                         self._process_and_show(ref)
                 return
+            open_annotator = True
+        else:
+            reply = QMessageBox.question(
+                self, "Zone Bulunamadı",
+                f"{Path(json_path).name} bulunamadı.\nAnnotator ile oluşturulsun mu?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            open_annotator = (reply == QMessageBox.Yes)
 
-        reply = QMessageBox.question(
-            self, "Zone Bulunamadı",
-            f"{Path(json_path).name} bulunamadı.\n"
-            "Zone çizmek için annotator açılsın mı?",
-            QMessageBox.Yes | QMessageBox.No
-        )
-        if reply != QMessageBox.Yes:
+        if not open_annotator:
             return
-
         try:
             from src.parking.zone_annotator import ZoneAnnotator
-            load_existing = json_path if Path(json_path).exists() else None
-            annotator = ZoneAnnotator(path, output_path=json_path,
-                                      load_path=load_existing)
-            annotator.run()
+            load_existing = json_path if json_exists else None
+            ZoneAnnotator(path, output_path=json_path, load_path=load_existing).run()
         except Exception as e:
             self.status_lbl.setText(f"Annotator hatası:\n{e}")
             return
-
         if Path(json_path).exists():
             if self._try_load_json(json_path):
                 ref = cv2.imread(path)
                 if ref is not None:
                     self._process_and_show(ref)
-        else:
-            self.status_lbl.setText("Zone kaydedilmedi.")
-
-    def _refresh_current_frame(self):
-        if self._last_frame is not None:
-            self._process_and_show(self._last_frame)
-
-    # ── Feed yönetimi ─────────────────────────────────────────────
-    def _clear_zones(self):
-        self.analyzer = None
-        self.zone_lbl.setText("Zone: yüklenmedi")
-        for card in self.park_cards.values():
-            card.set_count(0)
 
     def _auto_load_zones(self, source_path: str):
         json_path = str(Path(source_path).with_suffix(".json"))
         if Path(json_path).exists():
-            if self._try_load_json(json_path):
-                self.status_lbl.setText(
-                    f"Zone otomatik yüklendi: {Path(json_path).name}"
-                )
+            self._try_load_json(json_path)
         else:
-            self._clear_zones()
+            self.analyzer = None
+            self.zone_lbl.setText("Zone: yüklenmedi")
+            for card in self.park_cards.values():
+                card.set_count(0)
+            self.occupancy_lbl.setText("")
 
+    # ── Feed yönetimi ─────────────────────────────────────────────
     def _start_feed(self):
         self._last_time = time.time()
         self.stop_btn.setEnabled(True)
@@ -489,6 +478,7 @@ class MainWindow(QWidget):
             self.status_lbl.setText("Resim açılamadı.")
             return
         self._auto_load_zones(path)
+        self._last_frame = frame
         self._process_and_show(frame)
         self.status_lbl.setText("Resim yüklendi.")
 
@@ -518,6 +508,7 @@ class MainWindow(QWidget):
             self.status_lbl.setText("Bitti.")
             return
 
+        self._last_frame = frame
         self._process_and_show(frame)
 
         now = time.time()
@@ -526,7 +517,6 @@ class MainWindow(QWidget):
         self.fps_lbl.setText(f"FPS: {self._fps:.1f}")
 
     def _process_and_show(self, frame):
-        self._last_frame = frame.copy()
         counts = {cls_id: 0 for cls_id in VEHICLE_CLASSES}
         detections = []
 
@@ -538,17 +528,29 @@ class MainWindow(QWidget):
                     counts[cls_id] += 1
 
         available = occupied = forbidden = 0
+        out = frame.copy()
 
         if self.analyzer:
             result = self.analyzer.analyze(detections)
-            frame = self.analyzer.draw(frame, result, detections)
+            out = self.analyzer.draw(out, result, detections)
             available = result.available
             occupied  = result.occupied
             forbidden = result.forbidden_vehicles
+            total     = result.total_parking
+
             self.park_cards[STATUS_AVAILABLE].set_count(available)
             self.park_cards[STATUS_OCCUPIED].set_count(occupied)
             self.park_cards[STATUS_FORBIDDEN].set_count(forbidden)
+
+            if total > 0:
+                pct = int(occupied / total * 100)
+                self.occupancy_lbl.setText(f"{occupied}/{total} slot dolu  (%{pct})")
+            else:
+                self.occupancy_lbl.setText("")
         else:
+            for card in self.park_cards.values():
+                card.set_count(0)
+            self.occupancy_lbl.setText("")
             for det in detections:
                 cls_id = det.get("class_id")
                 if cls_id not in VEHICLE_CLASSES:
@@ -557,8 +559,8 @@ class MainWindow(QWidget):
                 conf = det["confidence"]
                 color = VEHICLE_COLORS_CV.get(cls_id, (0, 255, 0))
                 label = f"{VEHICLE_CLASSES[cls_id]} {conf:.2f}"
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(frame, label, (x1, y1 - 8),
+                cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(out, label, (x1, y1 - 8),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
         for cls_id, card in self.stat_cards.items():
@@ -566,7 +568,7 @@ class MainWindow(QWidget):
 
         self._log_frame(sum(counts.values()), available, occupied, forbidden)
 
-        self._rgb_buf = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        self._rgb_buf = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
         h, w, ch = self._rgb_buf.shape
         img = QImage(self._rgb_buf.data, w, h, ch * w, QImage.Format_RGB888)
         self.video_label.setPixmap(
