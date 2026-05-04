@@ -175,6 +175,44 @@ python scripts/plot_log.py --log outputs/metrics/log_20260421_155805.csv --save
 ```
 
 
+## Oto Tespit (PKLot Tabanlı — Zone Gerektirmez)
+
+### 1. Dataset İndir
+
+Ücretsiz Roboflow API key: https://roboflow.com → Settings → Roboflow API
+
+```bash
+python scripts/download_pklot.py --api-key YOUR_KEY
+python scripts/download_pklot.py --api-key YOUR_KEY --output data/pklot
+```
+
+Çıktı: `data/pklot/` (YOLOv8 formatında, 2 sınıf: boş=0, dolu=1)
+
+### 2. Modeli Eğit
+
+```bash
+# Temel eğitim
+python scripts/train_parking_detector.py --data-dir data/pklot
+
+# Epoch ve validation ile
+python scripts/train_parking_detector.py --data-dir data/pklot --epochs 50 --validate
+```
+
+Çıktı: `models/parking_detector/pklot_detector/weights/best.pt`
+
+### 3. GUI'de Kullan
+
+```bash
+python -m src.main
+```
+
+Sağ panelde "OTO TESPİT" bölümünden "🅿 Oto Model Yükle" butonuna tıkla →
+`models/parking_detector/pklot_detector/weights/best.pt` seç.
+
+Zone tanımlamaya gerek kalmadan boş/dolu slotlar otomatik tespit edilir.
+
+---
+
 ## Kurulum
 
 ```bash

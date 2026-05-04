@@ -17,6 +17,7 @@ class VehicleDetector:
 
         self.model_path = str(model_path)
         self.model = YOLO(self.model_path)
+        self.model.to("cpu")
         self.conf = conf
         self.iou = iou
 
@@ -50,8 +51,18 @@ class VehicleDetector:
         detections = []
         for box in results.boxes:
             class_id = int(box.cls[0])
+            bbox = box.xyxy[0].tolist()
+            # class 7 (truck): küçük bbox'lar aslında SUV/araba - yeniden sınıflandır
+            if class_id == 7 and not self._is_finetuned:
+                x1, y1, x2, y2 = bbox
+                w, h = x2 - x1, y2 - y1
+                area = w * h
+                frame_area = frame.shape[0] * frame.shape[1]
+                # Görüntünün %3'ünden küçükse büyük olasılıkla SUV/araba
+                if area < frame_area * 0.03:
+                    class_id = 2  # car
             detections.append({
-                "bbox": box.xyxy[0].tolist(),
+                "bbox": bbox,
                 "confidence": float(box.conf[0]),
                 "class_id": class_id,
                 "class_name": self.class_map.get(class_id, "vehicle"),

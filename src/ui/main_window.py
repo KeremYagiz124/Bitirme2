@@ -6,12 +6,15 @@ from pathlib import Path
 import cv2
 from PyQt5.QtWidgets import (
     QWidget, QLabel, QPushButton, QVBoxLayout,
-    QHBoxLayout, QFrame, QFileDialog, QGridLayout, QMessageBox, QSlider
+    QHBoxLayout, QFrame, QFileDialog, QGridLayout, QMessageBox, QSlider,
+    QScrollArea
 )
 from PyQt5.QtGui import QImage, QPixmap, QFont
 from PyQt5.QtCore import QTimer, Qt
 
 from src.detection.vehicle_detector import VehicleDetector
+from src.detection.parking_space_detector import _EMPTY_KEYWORDS
+from src.detection.street_parking_detector import StreetParkingDetector
 from src.parking import ZoneLoader, ParkingAnalyzer
 from src.parking import STATUS_AVAILABLE, STATUS_OCCUPIED, STATUS_FORBIDDEN
 
@@ -80,9 +83,16 @@ class MainWindow(QWidget):
         self.analyzer = None
         self._last_frame = None
         self._rgb_buf = None
+        self.auto_detector = None
 
-        self._conf_thresh = 0.50
-        self._iou_thresh  = 0.25
+        self._conf_thresh = 0.20
+        self._iou_thresh  = 0.15
+
+        self._street_mode       = False
+        self._min_gap_ratio     = 0.40   # yan kamera: park boşluğu ≈ 0.4-2.0× araç genişliği
+        self._row_band_ratio    = 0.80   # tek sıra band genişliği
+        self._ignore_top_ratio  = 0.20
+        self.street_detector: StreetParkingDetector | None = None
 
         self._log_file = None
         self._log_writer = None
@@ -94,145 +104,189 @@ class MainWindow(QWidget):
 
     # ── UI ────────────────────────────────────────────────────────
     def _build_ui(self):
-        self.video_label = QLabel("Video / Kamera Bekleniyor")
+        self.video_label = QLabel("Kamera / Video Bekleniyor")
         self.video_label.setAlignment(Qt.AlignCenter)
-        self.video_label.setStyleSheet("""
-            background-color: #0f172a;
-            border-radius: 12px;
-            color: #475569;
-            font-size: 14px;
-        """)
-        self.video_label.setMinimumSize(860, 640)
+        self.video_label.setStyleSheet(
+            "background-color:#0f172a; border-radius:12px; color:#475569; font-size:14px;"
+        )
+        self.video_label.setMinimumSize(900, 660)
 
         panel = QVBoxLayout()
-        panel.setSpacing(8)
-        panel.setContentsMargins(12, 16, 12, 16)
+        panel.setSpacing(6)
+        panel.setContentsMargins(14, 14, 14, 14)
 
+        # Başlık
         title = QLabel("Smart Parking AI")
-        title.setFont(QFont("Arial", 14, QFont.Bold))
-        title.setStyleSheet("color: #3b82f6;")
+        title.setFont(QFont("Arial", 13, QFont.Bold))
+        title.setStyleSheet("color:#3b82f6;")
         title.setAlignment(Qt.AlignCenter)
         panel.addWidget(title)
 
-        subtitle = QLabel("YOLOv8 · IoU Pipeline")
-        subtitle.setStyleSheet("color: #64748b; font-size: 10px;")
-        subtitle.setAlignment(Qt.AlignCenter)
-        panel.addWidget(subtitle)
+        fps_row = QHBoxLayout()
+        self.fps_lbl = QLabel("FPS: —")
+        self.fps_lbl.setStyleSheet("color:#64748b; font-size:10px;")
+        fps_row.addStretch()
+        fps_row.addWidget(self.fps_lbl)
+        panel.addLayout(fps_row)
 
-        # ── Kontroller ──
-        panel.addWidget(make_section_label("KONTROL"))
+        # ── Kaynak ──
+        panel.addWidget(make_section_label("KAYNAK"))
 
-        self.start_btn    = self._btn("▶  Kamera Başlat", "#2563eb")
-        self.stop_btn     = self._btn("■  Durdur",        "#dc2626")
-        self.img_btn      = self._btn("🖼  Resim Yükle",   "#7c3aed")
-        self.vid_btn      = self._btn("📂  Video Yükle",   "#0891b2")
-        self.zone_btn     = self._btn("📍  Zone Tanımla",  "#059669")
-        self.snapshot_btn = self._btn("📸  Snapshot Al",   "#b45309")
-        self.log_btn      = self._btn("⏺  Loglama Başlat","#0f766e")
-
+        src_grid = QGridLayout()
+        src_grid.setSpacing(5)
+        self.start_btn = self._btn("▶ Kamera", "#2563eb")
+        self.vid_btn   = self._btn("📂 Video",  "#0891b2")
+        self.img_btn   = self._btn("🖼 Resim",  "#7c3aed")
+        self.stop_btn  = self._btn("■ Durdur", "#dc2626")
         self.stop_btn.setEnabled(False)
         self.start_btn.clicked.connect(self.start_camera)
-        self.stop_btn.clicked.connect(self.stop_feed)
-        self.img_btn.clicked.connect(self.load_image)
         self.vid_btn.clicked.connect(self.load_video)
-        self.zone_btn.clicked.connect(self.load_zones_from_image)
-        self.snapshot_btn.clicked.connect(self.take_snapshot)
-        self.log_btn.clicked.connect(self.toggle_logging)
+        self.img_btn.clicked.connect(self.load_image)
+        self.stop_btn.clicked.connect(self.stop_feed)
+        src_grid.addWidget(self.start_btn, 0, 0)
+        src_grid.addWidget(self.vid_btn,   0, 1)
+        src_grid.addWidget(self.img_btn,   1, 0)
+        src_grid.addWidget(self.stop_btn,  1, 1)
+        panel.addLayout(src_grid)
 
-        for b in (self.start_btn, self.stop_btn, self.img_btn,
-                  self.vid_btn, self.zone_btn, self.snapshot_btn, self.log_btn):
-            panel.addWidget(b)
+        # ── Sokak Modu ──
+        panel.addWidget(make_section_label("SOKAK PARK MODU"))
 
-        self.zone_lbl = QLabel("Zone: yüklenmedi")
-        self.zone_lbl.setStyleSheet("color: #64748b; font-size: 10px;")
-        self.zone_lbl.setWordWrap(True)
-        panel.addWidget(self.zone_lbl)
+        self.street_btn = self._btn("🚗  Sokak Modunu Ac", "#0e7490")
+        self.street_btn.setCheckable(True)
+        self.street_btn.clicked.connect(self._toggle_street_mode)
+        self.street_btn.setFixedHeight(44)
+        panel.addWidget(self.street_btn)
 
-        # ── Sliderlar ──
-        panel.addWidget(make_section_label("AYARLAR"))
+        # Otomatik tespit ayarları
+        strip_box = QFrame()
+        strip_box.setStyleSheet(
+            "QFrame { background:#0c2233; border:1px solid #0e7490; border-radius:8px; }"
+        )
+        strip_layout = QVBoxLayout(strip_box)
+        strip_layout.setContentsMargins(8, 8, 8, 8)
+        strip_layout.setSpacing(4)
 
-        conf_desc = QLabel("Tespit hassasiyeti — dusuk: cok tespit, yuksek: emin ol")
-        conf_desc.setStyleSheet("color: #475569; font-size: 9px;")
-        conf_desc.setWordWrap(True)
-        panel.addWidget(conf_desc)
+        strip_layout.addWidget(self._info(
+            "Min Bosluk — arac genisligine oran (0.40 = arac genisliginin %40'i)"
+        ))
+        self._slider_row_into(
+            strip_layout, "Bos:", 20, 150, int(self._min_gap_ratio * 100),
+            lambda v: self._set_min_gap(v)
+        )
+        strip_layout.addWidget(self._info(
+            "Sira Band — ayni park sirasindaki araclari gruplama toleransi"
+        ))
+        self._slider_row_into(
+            strip_layout, "Sir:", 20, 150, int(self._row_band_ratio * 100),
+            lambda v: self._set_row_tol(v)
+        )
+        strip_layout.addWidget(self._info(
+            "Ust Yoksay — cercevenin ust %X'i (gokyuzu, agac) yok sayilir"
+        ))
+        self._slider_row_into(
+            strip_layout, "Yok:", 0, 60, int(self._ignore_top_ratio * 100),
+            lambda v: self._set_ignore_top(v)
+        )
+        panel.addWidget(strip_box)
+
+        # ── Araç Tespiti ──
+        panel.addWidget(make_section_label("ARAC TESPİTİ"))
+
         panel.addLayout(self._slider_row(
-            "Conf:", 10, 95, int(self._conf_thresh * 100),
+            "Conf:", 5, 95, int(self._conf_thresh * 100),
             lambda v: self._set_conf(v)
         ))
 
-        iou_desc = QLabel("Zone ortusme esigi — dusuk: az ortusme yeter, yuksek: tam ortusme")
-        iou_desc.setStyleSheet("color: #475569; font-size: 9px;")
-        iou_desc.setWordWrap(True)
-        panel.addWidget(iou_desc)
-        panel.addLayout(self._slider_row(
-            "IoU:", 5, 80, int(self._iou_thresh * 100),
-            lambda v: self._set_iou(v)
-        ))
-
-        # ── Tespit ──
-        panel.addWidget(make_section_label("TESPİT"))
-
+        counts_grid = QGridLayout()
+        counts_grid.setSpacing(4)
         self.stat_cards = {}
         icons = {2: "🚗", 3: "🏍", 5: "🚌", 7: "🚛"}
-        grid = QGridLayout()
-        grid.setSpacing(6)
         for i, (cls_id, name) in enumerate(VEHICLE_CLASSES.items()):
             card = StatCard(icons[cls_id], name, VEHICLE_COLORS_HEX[cls_id])
             self.stat_cards[cls_id] = card
-            grid.addWidget(card, i // 2, i % 2)
-        panel.addLayout(grid)
+            counts_grid.addWidget(card, i // 2, i % 2)
+        panel.addLayout(counts_grid)
 
         # ── Park Durumu ──
         panel.addWidget(make_section_label("PARK DURUMU"))
 
-        park_grid = QGridLayout()
-        park_grid.setSpacing(6)
         self.park_cards = {
-            STATUS_AVAILABLE: StatCard("🟢", "Bos Slot",  "#00dc50"),
-            STATUS_OCCUPIED:  StatCard("🔴", "Dolu Slot", "#3c3cdc"),
-            STATUS_FORBIDDEN: StatCard("⚠️",  "Yasak",    "#c82020"),
+            STATUS_AVAILABLE: StatCard("🟢", "Bos",  "#00dc50"),
+            STATUS_OCCUPIED:  StatCard("🔴", "Dolu", "#3c3cdc"),
+            STATUS_FORBIDDEN: StatCard("⚠️",  "Yasak","#c82020"),
         }
+        park_grid = QGridLayout()
+        park_grid.setSpacing(4)
         for i, card in enumerate(self.park_cards.values()):
             park_grid.addWidget(card, 0, i)
         panel.addLayout(park_grid)
 
-        # Doluluk oranı
         self.occupancy_lbl = QLabel("")
         self.occupancy_lbl.setStyleSheet(
-            "color: #f1f5f9; font-size: 12px; font-weight: bold;"
-            "background: #1e293b; border-radius: 6px; padding: 4px 8px;"
+            "color:#f1f5f9; font-size:12px; font-weight:bold;"
+            "background:#1e293b; border-radius:6px; padding:4px 8px;"
         )
         self.occupancy_lbl.setAlignment(Qt.AlignCenter)
         panel.addWidget(self.occupancy_lbl)
 
-        # ── Durum ──
+        # ── Durum / Log ──
         panel.addWidget(make_section_label("DURUM"))
 
-        self.status_lbl = QLabel("Hazır")
+        self.status_lbl = QLabel("Hazir")
         self.status_lbl.setWordWrap(True)
-        self.status_lbl.setStyleSheet("color: #e2e8f0; font-size: 12px;")
-        panel.addWidget(self.status_lbl)
+        self.status_lbl.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.status_lbl.setStyleSheet("color:#e2e8f0; font-size:10px; padding:4px;")
+        scroll = QScrollArea()
+        scroll.setWidget(self.status_lbl)
+        scroll.setWidgetResizable(True)
+        scroll.setFixedHeight(80)
+        scroll.setStyleSheet("background:#0f172a; border:1px solid #1e293b;")
+        panel.addWidget(scroll)
 
-        self.fps_lbl = QLabel("FPS: —")
-        self.fps_lbl.setStyleSheet("color: #64748b; font-size: 11px;")
-        panel.addWidget(self.fps_lbl)
+        btn_row = QHBoxLayout()
+        self.snapshot_btn = self._btn("📸 Snapshot", "#b45309")
+        self.log_btn      = self._btn("⏺ Log", "#0f766e")
+        self.snapshot_btn.clicked.connect(self.take_snapshot)
+        self.log_btn.clicked.connect(self.toggle_logging)
+        btn_row.addWidget(self.snapshot_btn)
+        btn_row.addWidget(self.log_btn)
+        panel.addLayout(btn_row)
+
+        # Zone (gizli — mevcut kodla uyumluluk için)
+        self.zone_lbl       = QLabel("")
+        self.auto_det_lbl   = QLabel("")
+        self.auto_det_btn   = QPushButton()
+        self.auto_clear_btn = QPushButton()
+        self.zone_btn       = QPushButton()
 
         panel.addStretch()
 
         panel_frame = QFrame()
-        panel_frame.setFixedWidth(280)
-        panel_frame.setStyleSheet("background-color: #0f172a; border-radius: 12px;")
+        panel_frame.setFixedWidth(270)
+        panel_frame.setStyleSheet("background-color:#0f172a; border-radius:12px;")
         panel_frame.setLayout(panel)
 
         root = QHBoxLayout()
-        root.setContentsMargins(12, 12, 12, 12)
-        root.setSpacing(12)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(10)
         root.addWidget(self.video_label, stretch=1)
         root.addWidget(panel_frame)
         self.setLayout(root)
 
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_frame)
+
+    def _info(self, text: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setStyleSheet("color:#475569; font-size:9px;")
+        lbl.setWordWrap(True)
+        return lbl
+
+    def _slider_row_into(self, layout, label_text, lo, hi, init, callback):
+        row = self._slider_row(label_text, lo, hi, init, callback)
+        layout.addLayout(row)
+        return row
 
     def _btn(self, text, color):
         b = QPushButton(text)
@@ -275,10 +329,52 @@ class MainWindow(QWidget):
         row.addWidget(val_lbl)
         return row
 
+    def _toggle_street_mode(self):
+        self._street_mode = self.street_btn.isChecked()
+        if self._street_mode:
+            self.street_btn.setText("🚗  Sokak Modu ACIK")
+            self._rebuild_street_detector()
+        else:
+            self.street_btn.setText("🚗  Sokak Modunu Ac")
+            self.street_detector = None
+        if self._last_frame is not None and self.cap is None:
+            self._process_and_show(self._last_frame)
+
+    def _rebuild_street_detector(self):
+        # Eğer mevcut detector varsa history'i sıfırla — yeni ayarlar için
+        self.street_detector = StreetParkingDetector(
+            min_gap_ratio=self._min_gap_ratio,
+            row_band_ratio=self._row_band_ratio,
+            ignore_top_ratio=self._ignore_top_ratio,
+        )
+
+    def _set_min_gap(self, v):
+        self._min_gap_ratio = v / 100
+        if self._street_mode:
+            self._rebuild_street_detector()
+        if self._last_frame is not None and self.cap is None:
+            self._process_and_show(self._last_frame)
+
+    def _set_row_tol(self, v):
+        self._row_band_ratio = v / 100
+        if self._street_mode:
+            self._rebuild_street_detector()
+        if self._last_frame is not None and self.cap is None:
+            self._process_and_show(self._last_frame)
+
+    def _set_ignore_top(self, v):
+        self._ignore_top_ratio = v / 100
+        if self._street_mode:
+            self._rebuild_street_detector()
+        if self._last_frame is not None and self.cap is None:
+            self._process_and_show(self._last_frame)
+
     def _set_conf(self, v):
         self._conf_thresh = v / 100
         if self.detector:
             self.detector.conf = self._conf_thresh
+        if self.auto_detector:
+            self.auto_detector.conf = self._conf_thresh
         if self._last_frame is not None and self.cap is None:
             self._process_and_show(self._last_frame)
 
@@ -286,6 +382,51 @@ class MainWindow(QWidget):
         self._iou_thresh = v / 100
         if self.analyzer:
             self.analyzer.iou_threshold = self._iou_thresh
+        if self._last_frame is not None and self.cap is None:
+            self._process_and_show(self._last_frame)
+
+    # ── Oto Tespit ────────────────────────────────────────────────
+    def _load_auto_detector(self):
+        from src.detection.parking_space_detector import ParkingSpaceDetector  # noqa: F811
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Parking Detector Model Seç", "models/",
+            "Model (*.pt)"
+        )
+        if not path:
+            return
+        try:
+            self.auto_detector = ParkingSpaceDetector(path, conf=self._conf_thresh)
+            self.auto_clear_btn.setEnabled(True)
+            # Sınıf eşleşmelerini göster
+            cmap = self.auto_detector.class_names
+            raw_names = self.auto_detector.model.names
+            bos_ids  = [f"{k}({raw_names[k]})" for k, v in cmap.items() if v == "BOS"]
+            dolu_ids = [f"{k}({raw_names[k]})" for k, v in cmap.items() if v == "DOLU"]
+            other_ids = [f"{k}:{v}({raw_names[k]})" for k, v in cmap.items() if v not in ("BOS", "DOLU")]
+            info = f"Model: {Path(path).name}\n"
+            info += f"BOS  → {bos_ids or 'EŞLEŞMEDİ!'}\n"
+            info += f"DOLU → {dolu_ids or 'EŞLEŞMEDİ!'}"
+            if other_ids:
+                info += f"\nDiğer → {other_ids}"
+            self.auto_det_lbl.setText(f"Model: {Path(path).name}")
+            self.status_lbl.setText(info)
+            if not bos_ids:
+                QMessageBox.warning(
+                    self, "Sınıf Eşleşme Uyarısı",
+                    f"Modelde BOS sınıfı bulunamadı!\n\n"
+                    f"Model sınıfları: {dict(raw_names)}\n\n"
+                    f"Beklenen anahtar kelimeler: {_EMPTY_KEYWORDS}"
+                )
+            if self._last_frame is not None and self.cap is None:
+                self._process_and_show(self._last_frame)
+        except Exception as e:
+            self.status_lbl.setText(f"Oto model hatası:\n{e}")
+
+    def _clear_auto_detector(self):
+        self.auto_detector = None
+        self.auto_det_lbl.setText("Model: yüklenmedi")
+        self.auto_clear_btn.setEnabled(False)
+        self.status_lbl.setText("Oto tespit modu kapatıldı.")
         if self._last_frame is not None and self.cap is None:
             self._process_and_show(self._last_frame)
 
@@ -438,6 +579,8 @@ class MainWindow(QWidget):
         self.start_btn.setEnabled(False)
         self.vid_btn.setEnabled(False)
         self.img_btn.setEnabled(False)
+        if self.street_detector:
+            self.street_detector.reset_history()
         self.timer.start(30)
 
     def start_camera(self):
@@ -530,18 +673,89 @@ class MainWindow(QWidget):
         available = occupied = forbidden = 0
         out = frame.copy()
 
-        if self.analyzer:
+        if self._street_mode and self.street_detector:
+            # Önce araçları normal şekilde çiz
+            for det in detections:
+                cls_id = det.get("class_id")
+                if cls_id not in VEHICLE_CLASSES:
+                    continue
+                x1, y1, x2, y2 = map(int, det["bbox"])
+                color = VEHICLE_COLORS_CV.get(cls_id, (0, 255, 0))
+                cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+
+            # Sonra otomatik boş park yeri tespiti üstüne çiz
+            result = self.street_detector.analyze(frame, detections)
+            out = self.street_detector.draw(out, result)
+
+            available = result["empty_count"]
+            occupied  = result["occupied_count"]
+            total     = available + occupied
+            self.park_cards[STATUS_AVAILABLE].set_count(available)
+            self.park_cards[STATUS_OCCUPIED].set_count(occupied)
+            self.park_cards[STATUS_FORBIDDEN].set_count(0)
+            if total > 0:
+                pct = int(occupied / total * 100)
+                self.occupancy_lbl.setText(f"{available} bos · {occupied} dolu  (%{pct})")
+            else:
+                self.occupancy_lbl.setText("Arac tespit edilemedi")
+            for cls_id, card in self.stat_cards.items():
+                card.set_count(counts[cls_id])
+            self._log_frame(sum(counts.values()), available, occupied, 0)
+            self._show_frame(out)
+            return
+
+        if self.auto_detector:
+            auto_dets = self.auto_detector.detect(frame)
+            out = self.auto_detector.draw(out, auto_dets)
+            # Araç kutularını üzerine çiz (etiketsiz)
+            for det in detections:
+                cls_id = det.get("class_id")
+                if cls_id not in VEHICLE_CLASSES:
+                    continue
+                x1, y1, x2, y2 = map(int, det["bbox"])
+                cv2.rectangle(out, (x1, y1), (x2, y2),
+                              VEHICLE_COLORS_CV.get(cls_id, (0, 255, 0)), 2)
+            available = sum(1 for d in auto_dets if d["status"] == "BOS")
+            occupied  = sum(1 for d in auto_dets if d["status"] == "DOLU")
+            # Model boş yer tespit edemiyorsa zone sistemiyle tamamla
+            if available == 0 and self.analyzer:
+                zone_result = self.analyzer.analyze(detections)
+                available = zone_result.available
+                occupied  = max(occupied, zone_result.occupied)
+            # Yasaklı zone'lar zone sistemiyle de gösterilebilir
+            if self.analyzer:
+                zone_result = self.analyzer.analyze(detections)
+                forbidden = zone_result.forbidden_vehicles
+                for zs in zone_result.zone_statuses:
+                    if zs.status == STATUS_FORBIDDEN:
+                        pts = zs.zone.polygon
+                        overlay = out.copy()
+                        cv2.fillPoly(overlay, [pts], (0, 0, 200))
+                        cv2.addWeighted(overlay, 0.30, out, 0.70, 0, out)
+                        cv2.polylines(out, [pts], True, (0, 0, 200), 2)
+                        cx = int(pts[:, 0].mean())
+                        cy = int(pts[:, 1].mean())
+                        cv2.putText(out, "YASAK", (cx - 25, cy + 6),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 200), 2, cv2.LINE_AA)
+            total = available + occupied
+            self.park_cards[STATUS_AVAILABLE].set_count(available)
+            self.park_cards[STATUS_OCCUPIED].set_count(occupied)
+            self.park_cards[STATUS_FORBIDDEN].set_count(forbidden)
+            if total > 0:
+                pct = int(occupied / total * 100)
+                self.occupancy_lbl.setText(f"{occupied}/{total} slot dolu  (%{pct})")
+            else:
+                self.occupancy_lbl.setText("")
+        elif self.analyzer:
             result = self.analyzer.analyze(detections)
             out = self.analyzer.draw(out, result, detections)
             available = result.available
             occupied  = result.occupied
             forbidden = result.forbidden_vehicles
             total     = result.total_parking
-
             self.park_cards[STATUS_AVAILABLE].set_count(available)
             self.park_cards[STATUS_OCCUPIED].set_count(occupied)
             self.park_cards[STATUS_FORBIDDEN].set_count(forbidden)
-
             if total > 0:
                 pct = int(occupied / total * 100)
                 self.occupancy_lbl.setText(f"{occupied}/{total} slot dolu  (%{pct})")
@@ -568,6 +782,9 @@ class MainWindow(QWidget):
 
         self._log_frame(sum(counts.values()), available, occupied, forbidden)
 
+        self._show_frame(out)
+
+    def _show_frame(self, out):
         self._rgb_buf = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
         h, w, ch = self._rgb_buf.shape
         img = QImage(self._rgb_buf.data, w, h, ch * w, QImage.Format_RGB888)

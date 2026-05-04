@@ -78,11 +78,24 @@ class ParkingAnalyzer:
         result = AnalysisResult()
         now = time.time()
 
+        def _is_overlapping(zone, bbox: list[float]) -> bool:
+            """Zone-araç örtüşmesi: coverage VEYA merkez noktası kontrolü.
+
+            Araç kamerası perspektifinde araç bbox'ları zone'dan çok büyük
+            olabilir; IoU düşük kalır ama coverage yüksek olur. İkisini
+            birden kontrol ederek her iki durumu da yakalarız.
+            """
+            if zone.coverage_by_bbox(bbox) >= self.iou_threshold:
+                return True
+            if zone.contains_center(bbox):
+                return True
+            return False
+
         # Forbidden zone check for each vehicle
         for i, det in enumerate(detections):
             bbox = det["bbox"]
             for fz in self.loader.forbidden_zones:
-                if fz.iou_with_bbox(bbox) >= self.iou_threshold:
+                if _is_overlapping(fz, bbox):
                     result.vehicle_labels[i] = STATUS_FORBIDDEN
                     break
 
@@ -90,7 +103,7 @@ class ParkingAnalyzer:
         for zone in self.loader.parking_zones:
             occupied_by = None
             for i, det in enumerate(detections):
-                if zone.iou_with_bbox(det["bbox"]) >= self.iou_threshold:
+                if _is_overlapping(zone, det["bbox"]):
                     occupied_by = det["bbox"]
                     break
 

@@ -1,6 +1,8 @@
 import sys
 import os
 
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 # Add project root to path for proper imports
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if project_root not in sys.path:

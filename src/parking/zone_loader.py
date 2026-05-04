@@ -34,6 +34,27 @@ class ParkingZone:
         union = np.logical_or(bbox_mask, poly_mask).sum()
         return float(intersection / union) if union > 0 else 0.0
 
+    def coverage_by_bbox(self, bbox: list[float]) -> float:
+        """Fraction of zone polygon covered by bbox (intersection / zone_area).
+
+        Araç kamerası perspektifinde araç bbox'ları zone poligonundan çok
+        büyük olabilir; bu durumda IoU düşük kalır ama zone büyük oranda
+        kaplanmış olur. Bu metrik o durumu doğru yakalar.
+        """
+        x1, y1, x2, y2 = map(int, bbox)
+        h = max(y2, self.polygon[:, 1].max()) + 1
+        w = max(x2, self.polygon[:, 0].max()) + 1
+
+        bbox_mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.rectangle(bbox_mask, (x1, y1), (x2, y2), 1, -1)
+
+        poly_mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillPoly(poly_mask, [self.polygon], 1)
+
+        zone_area = int(poly_mask.sum())
+        intersection = int(np.logical_and(bbox_mask, poly_mask).sum())
+        return float(intersection / zone_area) if zone_area > 0 else 0.0
+
 
 class ZoneLoader:
     def __init__(self, json_path: str):
