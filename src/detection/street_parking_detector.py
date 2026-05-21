@@ -634,6 +634,26 @@ class StreetParkingDetector:
                 confirmed.append(cur)
         return confirmed
 
+    # ── Ölçek tahmini (park edilmiş araçlar → piksel/metre) ──────
+    @staticmethod
+    def estimate_scale(rows: list, ref_car_length_m: float = 4.5) -> float | None:
+        """Park sırasındaki araç piksel genişliklerinden m/px ölçeği hesapla.
+
+        Yan kamera görüşünde araç piksel genişliği ≈ araç uzunluğu.
+        ref_car_length_m: referans araç uzunluğu (varsayılan: ortalama otomobil 4.5m).
+        Döner: m/px (None = yeterli veri yok).
+        """
+        widths_px = []
+        for row in rows:
+            for b in row:
+                widths_px.append(b[2] - b[0])
+        if not widths_px:
+            return None
+        med_px = float(np.median(widths_px))
+        if med_px < 1:
+            return None
+        return ref_car_length_m / med_px  # metre / piksel
+
     # ── Public API ────────────────────────────────────────────────
     def analyze(
         self,
@@ -642,12 +662,25 @@ class StreetParkingDetector:
         obstacles: list[dict] | None = None,
         static_mask: list[bool] | None = None,
         external_road_mask: np.ndarray | None = None,
+        ref_car_length_m: float = 4.5,
     ) -> dict:
         raw_empty, parked, rows = self._detect_raw(
             frame, detections, obstacles or [], static_mask,
             external_road_mask=external_road_mask,
         )
         confirmed = self._confirm(raw_empty)
+
+        # Ölçek tahmini ve slot boyutları (metre cinsinden)
+        scale = self.estimate_scale(rows, ref_car_length_m)
+        slot_sizes_m: list[tuple[float, float]] = []
+        for (x1, y1, x2, y2) in confirmed:
+            if scale is not None:
+                w_m = (x2 - x1) * scale
+                h_m = (y2 - y1) * scale
+            else:
+                w_m = h_m = 0.0
+            slot_sizes_m.append((round(w_m, 2), round(h_m, 2)))
+
         return {
             "parked":         parked,
             "rows":           rows,
@@ -656,29 +689,70 @@ class StreetParkingDetector:
             "empty_count":    len(confirmed),
             "occupied_count": len(parked),
             "obstacles":      obstacles or [],
+            "slot_sizes_m":   slot_sizes_m,   # [(uzunluk_m, derinlik_m), ...]
+            "scale_m_per_px": scale,           # None = kalibre edilemedi
         }
 
-    def draw(self, frame: np.ndarray, result: dict) -> np.ndarray:
+    def draw(
+        self,
+        frame: np.ndarray,
+        result: dict,
+        car_length_m: float | None = None,
+        car_width_m: float | None = None,
+    ) -> np.ndarray:
+        """Boş slotları çiz; araç boyutu verilmişse sığma durumunu göster.
+
+        car_length_m: aracın uzunluğu (sokak parkında slot genişliğiyle karşılaştırılır)
+        car_width_m : aracın genişliği (slot derinliğiyle karşılaştırılır, opsiyonel)
+        """
         out = frame.copy()
-        spaces = result["empty_spaces"]
+        spaces     = result["empty_spaces"]
+        sizes_m    = result.get("slot_sizes_m", [])
+        scale      = result.get("scale_m_per_px")
+        check_fit  = (car_length_m is not None and scale is not None and scale > 0)
+
         if not spaces:
             return out
 
+        COLOR_FIT   = (0, 220, 80)    # yeşil  — sığar
+        COLOR_NOFIT = (0, 60, 220)    # kırmızı — sığmaz
+        COLOR_UNK   = COLOR_EMPTY     # ölçek bilinmiyor
+
         overlay = out.copy()
-        for (x1, y1, x2, y2) in spaces:
-            cv2.rectangle(overlay, (x1, y1), (x2, y2), COLOR_EMPTY, -1)
+        for i, (x1, y1, x2, y2) in enumerate(spaces):
+            if check_fit and i < len(sizes_m):
+                w_m, h_m = sizes_m[i]
+                fits = w_m >= car_length_m * 0.95
+                if car_width_m and h_m > 0:
+                    fits = fits and (h_m >= car_width_m * 0.95)
+                color = COLOR_FIT if fits else COLOR_NOFIT
+            else:
+                color = COLOR_UNK
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
         cv2.addWeighted(overlay, 0.35, out, 0.65, 0, out)
 
-        for (x1, y1, x2, y2) in spaces:
-            cv2.rectangle(out, (x1, y1), (x2, y2), COLOR_EMPTY, 3)
-            label = "BOS"
-            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+        for i, (x1, y1, x2, y2) in enumerate(spaces):
+            if check_fit and i < len(sizes_m):
+                w_m, h_m = sizes_m[i]
+                fits = w_m >= car_length_m * 0.95
+                if car_width_m and h_m > 0:
+                    fits = fits and (h_m >= car_width_m * 0.95)
+                color = COLOR_FIT if fits else COLOR_NOFIT
+                label = f"{'SIGAR' if fits else 'SIGMAZ'} {w_m:.1f}m"
+            else:
+                color = COLOR_UNK
+                label = "BOS"
+            cv2.rectangle(out, (x1, y1), (x2, y2), color, 3)
+            font_scale = max(0.4, min(0.7, (x2 - x1) / 200))
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX,
+                                           font_scale, 2)
             cx = (x1 + x2) // 2
             cy = (y1 + y2) // 2
             cv2.rectangle(out,
-                          (cx - tw // 2 - 5, cy - th // 2 - 5),
-                          (cx + tw // 2 + 5, cy + th // 2 + 5),
-                          COLOR_EMPTY, -1)
+                          (cx - tw // 2 - 4, cy - th // 2 - 4),
+                          (cx + tw // 2 + 4, cy + th // 2 + 4),
+                          color, -1)
             cv2.putText(out, label, (cx - tw // 2, cy + th // 2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale,
+                        (255, 255, 255), 2, cv2.LINE_AA)
         return out

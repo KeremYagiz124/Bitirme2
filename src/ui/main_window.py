@@ -8,7 +8,7 @@ import numpy as np
 from PyQt5.QtWidgets import (
     QWidget, QLabel, QPushButton, QVBoxLayout,
     QHBoxLayout, QFrame, QFileDialog, QGridLayout, QMessageBox, QSlider,
-    QScrollArea
+    QScrollArea, QDoubleSpinBox
 )
 from PyQt5.QtGui import QImage, QPixmap, QFont
 from PyQt5.QtCore import QTimer, Qt
@@ -97,6 +97,10 @@ class MainWindow(QWidget):
         self._min_gap_ratio     = 0.30   # yan kamera: park boşluğu ≈ 0.3-2.0× araç genişliği
         self._row_band_ratio    = 0.80   # tek sıra band genişliği
         self._ignore_top_ratio  = 0.20
+        # Araç sığma kontrolü için boyutlar (metre)
+        self._ref_car_length_m  = 4.5   # ölçek kalibrasyonu için referans araç uzunluğu
+        self._user_car_length_m = 4.5   # kullanıcının aracının uzunluğu
+        self._user_car_width_m  = 1.8   # kullanıcının aracının genişliği
         self.street_detector: StreetParkingDetector | None = None
         # Performans: YOLO inference frame skipping.
         # Her N karede bir tam pipeline (YOLO + tracker + analiz);
@@ -231,6 +235,63 @@ class MainWindow(QWidget):
             lambda v: self._set_ignore_top(v)
         )
         panel.addWidget(strip_box)
+
+        # ── Araç Sığma Kontrolü ──
+        fit_box = QFrame()
+        fit_box.setStyleSheet(
+            "QFrame { background:#0c2233; border:1px solid #166534; border-radius:8px; }"
+        )
+        fit_layout = QVBoxLayout(fit_box)
+        fit_layout.setContentsMargins(8, 8, 8, 8)
+        fit_layout.setSpacing(6)
+
+        fit_lbl = QLabel("ARAC SIGMA KONTROLU")
+        fit_lbl.setStyleSheet("color:#4ade80; font-size:11px; font-weight:bold;")
+        fit_layout.addWidget(fit_lbl)
+
+        def _spin(label_text, value, min_v, max_v, callback):
+            row = QHBoxLayout()
+            lbl = QLabel(label_text)
+            lbl.setStyleSheet("color:#94a3b8; font-size:11px;")
+            lbl.setFixedWidth(90)
+            spin = QDoubleSpinBox()
+            spin.setRange(min_v, max_v)
+            spin.setSingleStep(0.1)
+            spin.setDecimals(1)
+            spin.setSuffix(" m")
+            spin.setValue(value)
+            spin.setFixedWidth(80)
+            spin.setStyleSheet(
+                "QDoubleSpinBox { background:#0f172a; color:#e2e8f0; "
+                "border:1px solid #334155; border-radius:4px; padding:2px; }"
+            )
+            spin.valueChanged.connect(callback)
+            row.addWidget(lbl)
+            row.addWidget(spin)
+            row.addStretch()
+            fit_layout.addLayout(row)
+
+        _spin("Ref. araç uzunluğu:", self._ref_car_length_m, 2.0, 8.0,
+              lambda v: setattr(self, "_ref_car_length_m", v) or
+              (self._last_frame is not None and self.cap is None and
+               self._process_and_show(self._last_frame)))
+        _spin("Aracın uzunluğu:", self._user_car_length_m, 2.0, 8.0,
+              lambda v: setattr(self, "_user_car_length_m", v) or
+              (self._last_frame is not None and self.cap is None and
+               self._process_and_show(self._last_frame)))
+        _spin("Aracın genişliği:", self._user_car_width_m, 1.0, 3.5,
+              lambda v: setattr(self, "_user_car_width_m", v) or
+              (self._last_frame is not None and self.cap is None and
+               self._process_and_show(self._last_frame)))
+
+        fit_info = QLabel(
+            "Yeşil=Sığar  Kırmızı=Sığmaz\n"
+            "Ref. uzunluk: park sırasındaki araçların\nortalama uzunluğu (ölçek kalibrasyonu)"
+        )
+        fit_info.setStyleSheet("color:#64748b; font-size:10px;")
+        fit_info.setWordWrap(True)
+        fit_layout.addWidget(fit_info)
+        panel.addWidget(fit_box)
 
         # ── Araç Tespiti ──
         panel.addWidget(make_section_label("ARAC TESPİTİ"))
@@ -826,6 +887,7 @@ class MainWindow(QWidget):
                     obstacles=self._last_obstacles,
                     static_mask=static_mask,
                     external_road_mask=self._last_drivable_mask,
+                    ref_car_length_m=self._ref_car_length_m,
                 )
 
                 # Occupancy heatmap güncelle (ego-motion ile kaydırılarak)
@@ -884,35 +946,54 @@ class MainWindow(QWidget):
             empty_spaces = result.get("empty_spaces", [])
             confs        = result.get("slot_confidences",
                                       [0.5] * len(empty_spaces))
+            sizes_m      = result.get("slot_sizes_m", [])
+            scale        = result.get("scale_m_per_px")
+            check_fit    = scale is not None and scale > 0
+            COLOR_FIT    = (0, 220, 80)
+            COLOR_NOFIT  = (0, 60, 220)
             if empty_spaces:
                 overlay = out.copy()
-                for s, c in zip(empty_spaces, confs):
+                for i, (s, c) in enumerate(zip(empty_spaces, confs)):
                     x1, y1, x2, y2 = map(int, s)
-                    cv2.rectangle(overlay, (x1, y1), (x2, y2),
-                                  (0, 220, 80), -1)
-                # Dolgu alfası ortalama confidence ile ölçekli (0.18-0.45)
+                    if check_fit and i < len(sizes_m):
+                        w_m, h_m = sizes_m[i]
+                        fits = w_m >= self._user_car_length_m * 0.95
+                        if h_m > 0:
+                            fits = fits and (h_m >= self._user_car_width_m * 0.95)
+                        color = COLOR_FIT if fits else COLOR_NOFIT
+                    else:
+                        color = COLOR_FIT
+                    cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
                 avg_c = float(np.mean(confs)) if confs else 0.5
                 alpha = 0.18 + 0.27 * avg_c
                 cv2.addWeighted(overlay, alpha, out, 1 - alpha, 0, out)
-                for s, c in zip(empty_spaces, confs):
+                for i, (s, c) in enumerate(zip(empty_spaces, confs)):
                     x1, y1, x2, y2 = map(int, s)
-                    # Kontur kalınlığı confidence'a göre 2-3
+                    if check_fit and i < len(sizes_m):
+                        w_m, h_m = sizes_m[i]
+                        fits = w_m >= self._user_car_length_m * 0.95
+                        if h_m > 0:
+                            fits = fits and (h_m >= self._user_car_width_m * 0.95)
+                        color = COLOR_FIT if fits else COLOR_NOFIT
+                        label = f"{'SIGAR' if fits else 'SIGMAZ'} {w_m:.1f}m"
+                    else:
+                        color = COLOR_FIT
+                        label = f"BOS %{int(c * 100)}"
                     thick = 3 if c >= 0.6 else 2
-                    cv2.rectangle(out, (x1, y1), (x2, y2),
-                                  (0, 220, 80), thick)
-                    label = f"BOS %{int(c * 100)}"
+                    cv2.rectangle(out, (x1, y1), (x2, y2), color, thick)
+                    font_s = max(0.4, min(0.55, (x2 - x1) / 220))
                     (tw, th), _ = cv2.getTextSize(label,
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+                                  cv2.FONT_HERSHEY_SIMPLEX, font_s, 2)
                     cx = (x1 + x2) // 2
                     cy = (y1 + y2) // 2
                     cv2.rectangle(out,
                                   (cx - tw // 2 - 4, cy - th // 2 - 4),
                                   (cx + tw // 2 + 4, cy + th // 2 + 4),
-                                  (0, 220, 80), -1)
+                                  color, -1)
                     cv2.putText(out, label,
                                 (cx - tw // 2, cy + th // 2),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.55,
-                                (0, 0, 0), 2, cv2.LINE_AA)
+                                cv2.FONT_HERSHEY_SIMPLEX, font_s,
+                                (255, 255, 255), 2, cv2.LINE_AA)
 
             # Öğrenilmiş kalıcı slot'lar — yalnızca BOS olanları göster.
             # DOLU slot'lar araç bbox'ı ile zaten temsil edildiği için
