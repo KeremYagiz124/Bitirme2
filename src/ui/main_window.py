@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 
 import cv2
+import numpy as np
 from PyQt5.QtWidgets import (
     QWidget, QLabel, QPushButton, QVBoxLayout,
     QHBoxLayout, QFrame, QFileDialog, QGridLayout, QMessageBox, QSlider,
@@ -15,6 +16,10 @@ from PyQt5.QtCore import QTimer, Qt
 from src.detection.vehicle_detector import VehicleDetector
 from src.detection.parking_space_detector import _EMPTY_KEYWORDS
 from src.detection.street_parking_detector import StreetParkingDetector
+from src.detection.vehicle_tracker import VehicleTracker
+from src.parking.learned_slot_memory import LearnedSlotMemory
+from src.parking.occupancy_heatmap import OccupancyHeatmap
+from src.detection.drivable_area import DrivableAreaSegmenter
 from src.parking import ZoneLoader, ParkingAnalyzer
 from src.parking import STATUS_AVAILABLE, STATUS_OCCUPIED, STATUS_FORBIDDEN
 
@@ -89,10 +94,47 @@ class MainWindow(QWidget):
         self._iou_thresh  = 0.15
 
         self._street_mode       = False
-        self._min_gap_ratio     = 0.40   # yan kamera: park boşluğu ≈ 0.4-2.0× araç genişliği
+        self._min_gap_ratio     = 0.30   # yan kamera: park boşluğu ≈ 0.3-2.0× araç genişliği
         self._row_band_ratio    = 0.80   # tek sıra band genişliği
         self._ignore_top_ratio  = 0.20
         self.street_detector: StreetParkingDetector | None = None
+        # Performans: YOLO inference frame skipping.
+        # Her N karede bir tam pipeline (YOLO + tracker + analiz);
+        # ara karelerde son sonuçlar yeniden kullanılır — bbox'lar 1-2 frame
+        # eski olabilir ama görsel akıcı kalır. N=3 → ~3x hızlanma.
+        self._inference_period  = 3
+        self._inference_tick    = 0
+        self._last_detections: list = []
+        self._last_obstacles:  list = []
+        self._last_result: dict | None = None
+        self._last_learned_status: list = []
+        self._last_static_mask: list | None = None
+        # Araç tracker (hareketli ≠ park etmiş ayrımı)
+        self.vehicle_tracker    = VehicleTracker(
+            history_len=60,
+            min_history=8,
+            max_disp_ratio=0.18,
+        )
+        # Long-term öğrenilmiş slot kütüğü
+        self.learned_slots      = LearnedSlotMemory()
+        # Bir aracı "kalıcı slot" saymak için minimum statik tracker güncellemesi.
+        # Frame skipping (period=3) nedeniyle bu değer × period kadar gerçek
+        # frame'e karşılık gelir. 30 × 3 = 90 gerçek frame ≈ 3 sn @30 FPS.
+        self._learn_min_frames  = 30
+        # Zamansal araç olasılığı haritası — slot adaylarını filtreler ve
+        # her slot için 0-1 güven skoru üretir.
+        self.heatmap            = OccupancyHeatmap()
+        self._slot_min_prob     = 0.04  # gerçek slot için minimum olasılık
+        # Drivable area segmentasyonu (YOLOPv2). Model varsa yol yüzeyi
+        # maskesi klasik LAB maskesinin yerini alır (çok daha doğru).
+        # Ağır (~58 ms) → seyrek çalıştır + cache.
+        try:
+            self.drivable = DrivableAreaSegmenter("models/yolopv2.pt")
+        except Exception:
+            self.drivable = None
+        self._drivable_period   = 12   # her 12 inference frame'de bir (~1.2 sn)
+        self._drivable_tick     = 0
+        self._last_drivable_mask = None
 
         self._log_file = None
         self._log_writer = None
@@ -171,14 +213,14 @@ class MainWindow(QWidget):
             "Min Bosluk — arac genisligine oran (0.40 = arac genisliginin %40'i)"
         ))
         self._slider_row_into(
-            strip_layout, "Bos:", 20, 150, int(self._min_gap_ratio * 100),
+            strip_layout, "Bos:", 10, 150, int(self._min_gap_ratio * 100),
             lambda v: self._set_min_gap(v)
         )
         strip_layout.addWidget(self._info(
             "Sira Band — ayni park sirasindaki araclari gruplama toleransi"
         ))
         self._slider_row_into(
-            strip_layout, "Sir:", 20, 150, int(self._row_band_ratio * 100),
+            strip_layout, "Sir:", 30, 150, int(self._row_band_ratio * 100),
             lambda v: self._set_row_tol(v)
         )
         strip_layout.addWidget(self._info(
@@ -341,11 +383,21 @@ class MainWindow(QWidget):
             self._process_and_show(self._last_frame)
 
     def _rebuild_street_detector(self):
-        # Eğer mevcut detector varsa history'i sıfırla — yeni ayarlar için
+        """Street detector'ı tüm iyileştirilmiş parametrelerle yeniden oluştur."""
         self.street_detector = StreetParkingDetector(
             min_gap_ratio=self._min_gap_ratio,
             row_band_ratio=self._row_band_ratio,
             ignore_top_ratio=self._ignore_top_ratio,
+            # İyileştirilmiş sabit parametreler
+            bottom_align_tol=0.35,
+            lateral_split_ratio=3.5,
+            max_gap_ratio=5.0,
+            max_spaces_per_gap=3,
+            max_edge_extension_ratio=0.40,
+            road_center_reject_ratio=0.0,
+            road_color_tol_h=35.0,
+            road_color_tol_s=80.0,
+            road_color_tol_v=80.0,
         )
 
     def _set_min_gap(self, v):
@@ -581,6 +633,17 @@ class MainWindow(QWidget):
         self.img_btn.setEnabled(False)
         if self.street_detector:
             self.street_detector.reset_history()
+        self.vehicle_tracker.reset()
+        self.learned_slots.reset()
+        self.heatmap.reset()
+        self._drivable_tick = 0
+        self._last_drivable_mask = None
+        self._inference_tick = 0
+        self._last_detections = []
+        self._last_obstacles = []
+        self._last_result = None
+        self._last_learned_status = []
+        self._last_static_mask = None
         self.timer.start(30)
 
     def start_camera(self):
@@ -620,6 +683,16 @@ class MainWindow(QWidget):
         if frame is None:
             self.status_lbl.setText("Resim açılamadı.")
             return
+        # Bug #1-2: Yeni fotoğraf yüklenince tüm önbellek sıfırlanmalı.
+        # Aksi halde _last_result bir önceki fotoğrafın analiz sonucunu
+        # taşır ve yeni fotoğrafta hiç analiz yapılmaz.
+        self._last_result = None
+        self._last_obstacles = []
+        self._last_drivable_mask = None
+        self._last_detections = []
+        self._last_static_mask = None
+        if self.street_detector is not None:
+            self.street_detector.reset_history()
         self._auto_load_zones(path)
         self._last_frame = frame
         self._process_and_show(frame)
@@ -663,8 +736,28 @@ class MainWindow(QWidget):
         counts = {cls_id: 0 for cls_id in VEHICLE_CLASSES}
         detections = []
 
+        # Inference stratejisi:
+        #  - Street mode video/kamera → her N frame'de bir YOLO+engel birleşik
+        #    çağrı (frame skipping); ara karelerde cache.
+        #  - Diğer modlar → her frame YOLO (mevcut davranış).
         if self.detector:
-            detections = self.detector.detect(frame)
+            if self._street_mode and self.cap is not None:
+                # Video/kamera: frame skipping ile YOLO+engel çağrısı
+                if self._inference_tick % self._inference_period == 0:
+                    vehicles, obstacles = self.detector.detect_all(frame)
+                    self._last_detections = vehicles
+                    self._last_obstacles  = obstacles
+                self._inference_tick += 1
+                detections = self._last_detections
+            elif self._street_mode:
+                # Bug #3: Fotoğraf modunda da detect_all çağrılmalı;
+                # aksi halde _last_obstacles boş kalır ve engel maskeleme çalışmaz.
+                vehicles, obstacles = self.detector.detect_all(frame)
+                detections = vehicles
+                self._last_obstacles = obstacles
+            else:
+                detections = self.detector.detect(frame)
+
             for det in detections:
                 cls_id = det.get("class_id")
                 if cls_id in VEHICLE_CLASSES:
@@ -683,12 +776,179 @@ class MainWindow(QWidget):
                 color = VEHICLE_COLORS_CV.get(cls_id, (0, 255, 0))
                 cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
 
-            # Sonra otomatik boş park yeri tespiti üstüne çiz
-            result = self.street_detector.analyze(frame, detections)
-            out = self.street_detector.draw(out, result)
+            # Tracker + analiz + öğrenme: yalnızca inference frame'inde yenile.
+            # Ara karelerde cached result/learned_status kullanılır → 3x hız.
+            is_inference_frame = (
+                self.cap is not None
+                and (self._inference_tick - 1) % self._inference_period == 0
+            )
 
-            available = result["empty_count"]
-            occupied  = result["occupied_count"]
+            if self.cap is None:
+                static_mask = None
+            elif is_inference_frame:
+                # Frame'i tracker'a geçir → ego-motion (optik akış) düzeltmesi
+                static_mask = self.vehicle_tracker.update(detections, frame=frame)
+                self._last_static_mask = static_mask
+            else:
+                static_mask = self._last_static_mask
+
+            if is_inference_frame or self._last_result is None:
+                # Drivable area (YOLOPv2) — seyrek hesapla + cache (ağır model)
+                if (self.drivable is not None and self.drivable.available
+                        and self.cap is not None):
+                    if (self._drivable_tick % self._drivable_period == 0
+                            or self._last_drivable_mask is None):
+                        try:
+                            da_mask, _ll = self.drivable.infer(frame)
+                            # Park yerleri yol-kaldırım SINIRINDA → drivable
+                            # area'yı dilate ederek kenarı içeri al. Aksi halde
+                            # slot bbox'larının yarısı kaldırıma düşüp elenir.
+                            if da_mask is not None:
+                                # Park yerleri yol kenarındaki şeride uzandığı
+                                # için drivable area'yı yatayda DAHA çok
+                                # dilate ediyoruz (dikeyde araya kaldırım
+                                # girmesin diye yatay > dikey).
+                                # Bug #5: Geniş kernel maske bisiklet yolu /
+                                # kaldırıma sızıyor. Kernel boyutunu küçülttük.
+                                kx = max(10, int(frame.shape[1] * 0.018))
+                                ky = max(5, int(frame.shape[0] * 0.010))
+                                kernel = cv2.getStructuringElement(
+                                    cv2.MORPH_RECT, (kx, ky)
+                                )
+                                da_mask = cv2.dilate(da_mask, kernel, iterations=1)
+                            self._last_drivable_mask = da_mask
+                        except Exception:
+                            self._last_drivable_mask = None
+                    self._drivable_tick += 1
+
+                result = self.street_detector.analyze(
+                    frame, detections,
+                    obstacles=self._last_obstacles,
+                    static_mask=static_mask,
+                    external_road_mask=self._last_drivable_mask,
+                )
+
+                # Occupancy heatmap güncelle (ego-motion ile kaydırılarak)
+                if self.cap is not None:
+                    vehicle_bboxes = [d["bbox"] for d in detections]
+                    ego_dx, ego_dy = self.vehicle_tracker.last_ego_motion
+                    self.heatmap.update(frame.shape, vehicle_bboxes,
+                                        ego_dx=ego_dx, ego_dy=ego_dy)
+
+                learned_status: list = []
+                if self.cap is not None:
+                    static_tracks = self.vehicle_tracker.get_static_tracks(
+                        min_frames=self._learn_min_frames
+                    )
+                    vehicle_bboxes = [d["bbox"] for d in detections]
+                    learned_status = self.learned_slots.update(
+                        static_tracks, vehicle_bboxes,
+                        road_mask=self._last_drivable_mask,
+                    )
+
+                # Heuristic boş slot'lardan öğrenilmiş ile çakışanları çıkar
+                from src.detection.street_parking_detector import _bbox_iou as _iou_fn
+                learned_bboxes = [s["bbox"] for s in learned_status]
+                result["empty_spaces"] = [
+                    e for e in result["empty_spaces"]
+                    if not any(_iou_fn(e, lb) > 0.40 for lb in learned_bboxes)
+                ]
+
+                # Heatmap süzgeci: ısınma sonrası, slot'un altındaki bölgede
+                # geçmişte hiç araç görülmediyse (yol ortası, kaldırım) ele.
+                # Her geçen slot için 0-1 confidence skoru üret.
+                slot_confidences: list[float] = []
+                if self.cap is not None and self.heatmap.is_warmed_up:
+                    filtered = []
+                    for s in result["empty_spaces"]:
+                        # Slot çevresinde park sırası araç(lar)ı var mı?
+                        # Yolun ortasındaki/hayalî slot'lar 0'a yakın olur.
+                        p = self.heatmap.slot_neighborhood_max(
+                            s, frame.shape, expand=0.6
+                        )
+                        if p >= self._slot_min_prob:
+                            filtered.append(s)
+                            slot_confidences.append(min(1.0, p / 0.5))
+                    result["empty_spaces"]    = filtered
+                    result["slot_confidences"] = slot_confidences
+                else:
+                    result["slot_confidences"] = [0.5] * len(result["empty_spaces"])
+
+                self._last_result = result
+                self._last_learned_status = learned_status
+            else:
+                result = self._last_result
+                learned_status = self._last_learned_status
+
+            # Çizim katmanları — heuristic boş slot'lar confidence-aware
+            empty_spaces = result.get("empty_spaces", [])
+            confs        = result.get("slot_confidences",
+                                      [0.5] * len(empty_spaces))
+            if empty_spaces:
+                overlay = out.copy()
+                for s, c in zip(empty_spaces, confs):
+                    x1, y1, x2, y2 = map(int, s)
+                    cv2.rectangle(overlay, (x1, y1), (x2, y2),
+                                  (0, 220, 80), -1)
+                # Dolgu alfası ortalama confidence ile ölçekli (0.18-0.45)
+                avg_c = float(np.mean(confs)) if confs else 0.5
+                alpha = 0.18 + 0.27 * avg_c
+                cv2.addWeighted(overlay, alpha, out, 1 - alpha, 0, out)
+                for s, c in zip(empty_spaces, confs):
+                    x1, y1, x2, y2 = map(int, s)
+                    # Kontur kalınlığı confidence'a göre 2-3
+                    thick = 3 if c >= 0.6 else 2
+                    cv2.rectangle(out, (x1, y1), (x2, y2),
+                                  (0, 220, 80), thick)
+                    label = f"BOS %{int(c * 100)}"
+                    (tw, th), _ = cv2.getTextSize(label,
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+                    cx = (x1 + x2) // 2
+                    cy = (y1 + y2) // 2
+                    cv2.rectangle(out,
+                                  (cx - tw // 2 - 4, cy - th // 2 - 4),
+                                  (cx + tw // 2 + 4, cy + th // 2 + 4),
+                                  (0, 220, 80), -1)
+                    cv2.putText(out, label,
+                                (cx - tw // 2, cy + th // 2),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                                (0, 0, 0), 2, cv2.LINE_AA)
+
+            # Öğrenilmiş kalıcı slot'lar — yalnızca BOS olanları göster.
+            # DOLU slot'lar araç bbox'ı ile zaten temsil edildiği için
+            # tekrar çizmek görsel kalabalık yaratıyor.
+            COLOR_LEARNED_EMPTY = (255, 200, 0)   # cyan
+            learned_empty_slots = [s for s in learned_status if not s["occupied"]]
+            if learned_empty_slots:
+                overlay = out.copy()
+                for s in learned_empty_slots:
+                    x1, y1, x2, y2 = map(int, s["bbox"])
+                    cv2.rectangle(overlay, (x1, y1), (x2, y2),
+                                  COLOR_LEARNED_EMPTY, -1)
+                cv2.addWeighted(overlay, 0.18, out, 0.82, 0, out)
+                for s in learned_empty_slots:
+                    x1, y1, x2, y2 = map(int, s["bbox"])
+                    cv2.rectangle(out, (x1, y1), (x2, y2),
+                                  COLOR_LEARNED_EMPTY, 2)
+                    # Etiket yalnızca slot yeterince büyükse
+                    if (x2 - x1) >= 40 and (y2 - y1) >= 20:
+                        cv2.putText(out, "BOS+", (x1 + 4, y2 - 6),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                                    COLOR_LEARNED_EMPTY, 2, cv2.LINE_AA)
+
+            # Engelleri sadece ince konturla; etiket yazma (kalabalık azaltma)
+            for ob in self._last_obstacles:
+                ox1, oy1, ox2, oy2 = map(int, ob["bbox"])
+                cv2.rectangle(out, (ox1, oy1), (ox2, oy2), (60, 60, 220), 1)
+
+            # Sayımlar: öğrenilmiş + dedup'lanmış heuristic
+            learned_empty    = sum(1 for s in learned_status if not s["occupied"])
+            learned_occupied = sum(1 for s in learned_status if s["occupied"])
+            heuristic_empty  = len(result["empty_spaces"])
+            # DOLU: tracker'ın gördüğü tüm statik araçlar (heuristic parked
+            # zaten learned slot'ları da içerebilir — max ile birleştir)
+            available = learned_empty + heuristic_empty
+            occupied  = max(result["occupied_count"], learned_occupied)
             total     = available + occupied
             self.park_cards[STATUS_AVAILABLE].set_count(available)
             self.park_cards[STATUS_OCCUPIED].set_count(occupied)
