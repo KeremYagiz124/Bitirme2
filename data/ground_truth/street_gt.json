@@ -1,0 +1,23 @@
+{
+  "description": "Sokak modu test görüntüleri için ground truth anotasyonları",
+  "images": [
+    {
+      "path": "1.png",
+      "expected_empty_count": 0,
+      "expected_parked_count": 2,
+      "note": "Sol: minibüs, sağ: beyaz sedan — ortadaki alan plaza, park yeri değil"
+    },
+    {
+      "path": "2.png",
+      "expected_empty_count": 2,
+      "expected_parked_count": 5,
+      "note": "Kıyı şeridi sokak parkı, 5 araç, 2 boş alan"
+    },
+    {
+      "path": "3.png",
+      "expected_empty_count": 3,
+      "expected_parked_count": 7,
+      "note": "Palmiyeli cadde park şeridi, 7 araç, 3 boş alan"
+    }
+  ]
+}
