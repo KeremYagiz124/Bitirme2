@@ -8,6 +8,7 @@ Park alanı tespiti için: yalnızca statik araçlar park sırası oluşturur,
 böylece hareket halindeki araçlar yanlış slot tespitlerine neden olmaz.
 """
 
+import time
 from collections import deque
 from typing import List, Optional
 
@@ -27,7 +28,7 @@ def _iou(a, b) -> float:
 
 
 class _Track:
-    __slots__ = ("id", "bbox", "history", "misses", "frames_seen")
+    __slots__ = ("id", "bbox", "history", "misses", "frames_seen", "first_seen")
 
     def __init__(self, tid: int, bbox, history_len: int):
         self.id          = tid
@@ -35,6 +36,7 @@ class _Track:
         self.history     = deque([self._center(bbox)], maxlen=history_len)
         self.misses      = 0
         self.frames_seen = 1
+        self.first_seen  = time.time()
 
     @staticmethod
     def _center(b):
@@ -154,6 +156,17 @@ class VehicleTracker:
                 self.min_history, self.max_disp_ratio
             ):
                 out.append(tuple(tr.bbox))
+        return out
+
+    def get_static_tracks_with_duration(self, min_frames: int = 20) -> list[tuple]:
+        """Statik track'leri (bbox, duration_sec) çiftleri olarak döner."""
+        now = time.time()
+        out = []
+        for tr in self._tracks.values():
+            if tr.frames_seen >= min_frames and tr.is_static(
+                self.min_history, self.max_disp_ratio
+            ):
+                out.append((tuple(tr.bbox), now - tr.first_seen))
         return out
 
     def update(self, detections: list[dict],

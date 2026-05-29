@@ -698,13 +698,8 @@ class StreetParkingDetector:
         frame: np.ndarray,
         result: dict,
         car_length_m: float | None = None,
-        car_width_m: float | None = None,
     ) -> np.ndarray:
-        """Boş slotları çiz; araç boyutu verilmişse sığma durumunu göster.
-
-        car_length_m: aracın uzunluğu (sokak parkında slot genişliğiyle karşılaştırılır)
-        car_width_m : aracın genişliği (slot derinliğiyle karşılaştırılır, opsiyonel)
-        """
+        """Boş slotları çiz; araç uzunluğu verilmişse sığma durumunu göster."""
         out = frame.copy()
         spaces     = result["empty_spaces"]
         sizes_m    = result.get("slot_sizes_m", [])
@@ -721,10 +716,8 @@ class StreetParkingDetector:
         overlay = out.copy()
         for i, (x1, y1, x2, y2) in enumerate(spaces):
             if check_fit and i < len(sizes_m):
-                w_m, h_m = sizes_m[i]
-                fits = w_m >= car_length_m * 0.95
-                if car_width_m and h_m > 0:
-                    fits = fits and (h_m >= car_width_m * 0.95)
+                w_m = sizes_m[i][0]
+                fits = w_m >= car_length_m
                 color = COLOR_FIT if fits else COLOR_NOFIT
             else:
                 color = COLOR_UNK
@@ -733,10 +726,8 @@ class StreetParkingDetector:
 
         for i, (x1, y1, x2, y2) in enumerate(spaces):
             if check_fit and i < len(sizes_m):
-                w_m, h_m = sizes_m[i]
-                fits = w_m >= car_length_m * 0.95
-                if car_width_m and h_m > 0:
-                    fits = fits and (h_m >= car_width_m * 0.95)
+                w_m = sizes_m[i][0]
+                fits = w_m >= car_length_m
                 color = COLOR_FIT if fits else COLOR_NOFIT
                 label = f"{'SIGAR' if fits else 'SIGMAZ'} {w_m:.1f}m"
             else:

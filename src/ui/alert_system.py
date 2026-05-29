@@ -72,7 +72,7 @@ class AlertSystem:
 
     # ── Hazır koşul kontrolleri ──
 
-    def check_occupancy(self, available: int, occupied: int):
+    def check_occupancy(self, available: int, occupied: int, warn_threshold: int = 80):
         total = available + occupied
         if total == 0:
             return
@@ -83,7 +83,7 @@ class AlertSystem:
                 AlertLevel.CRITICAL,
                 "Park alani tamamen dolu! Bos yer kalmadi.",
             )
-        elif pct >= 80:
+        elif pct >= warn_threshold:
             self.fire(
                 "park_high",
                 AlertLevel.WARNING,
