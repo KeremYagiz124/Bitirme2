@@ -73,6 +73,8 @@ class StreetParkingDetector:
         smoothing_frames: int      = 5,
         smoothing_min_hits: int    = 3,
         match_iou: float           = 0.35,
+        # Park yönü: "parallel" (sokak/yan kamera) | "perpendicular" (dik park/üstten)
+        orientation: str           = "parallel",
     ):
         self.min_gap_ratio            = min_gap_ratio
         self.max_gap_ratio            = max_gap_ratio
@@ -101,6 +103,7 @@ class StreetParkingDetector:
         self.smoothing_frames         = smoothing_frames
         self.smoothing_min_hits       = smoothing_min_hits
         self.match_iou                = match_iou
+        self.orientation              = orientation
 
         self._history: deque = deque(maxlen=smoothing_frames)
 
@@ -112,6 +115,7 @@ class StreetParkingDetector:
         self._history.clear()
         self._road_mask_cache = None
         self._analyze_count   = 0
+        self._perp_side_view  = False
 
     # ── Aday filtre ───────────────────────────────────────────────
     def _filter_candidates(self, frame_shape, detections, static_mask=None):
@@ -130,8 +134,13 @@ class StreetParkingDetector:
                 continue
             if cy < y_min:
                 continue
-            if bh > 0 and bw / bh < 0.8:
-                continue
+            # Paralel modda araçlar yatay; dik modda araçlar dikey de olabilir
+            if self.orientation == "parallel":
+                if bh > 0 and bw / bh < 0.8:
+                    continue
+            else:
+                if bh > 0 and bw / bh < 0.25:
+                    continue
             out.append(b)
         return out
 
@@ -503,6 +512,12 @@ class StreetParkingDetector:
         frame_edge_margin = self.frame_edge_margin_ratio * w
         max_edge_ext      = self.max_edge_extension_ratio * w
 
+        # Dik-yan görünümde boş slot ≈ araç eni ≈ araç uzunluğunun ~%44'ü.
+        # Bu yüzden min_gap_ratio daha büyük olmalı; küçük buffer boşlukları elenir.
+        _perp_side = (self.orientation == "perpendicular"
+                      and getattr(self, "_perp_side_view", False))
+        eff_min_gap = max(self.min_gap_ratio, 0.40) if _perp_side else self.min_gap_ratio
+
         def _add(gap_x1: float, gap_x2: float, base_bot: float) -> None:
             gap_w = gap_x2 - gap_x1
             if gap_w <= 0:
@@ -510,22 +525,37 @@ class StreetParkingDetector:
             mid_x = (gap_x1 + gap_x2) / 2
             local_w = width_at(mid_x)
             local_h = height_at(mid_x)
-            if gap_w < self.min_gap_ratio * local_w:
+            if gap_w < eff_min_gap * local_w:
                 return
-            n = max(1, int(round(gap_w / local_w)))
-            n = min(n, self.max_spaces_per_gap)
+            # Dik modda bölme yapma: her boşluk tek slot — kullanıcı aracının
+            # toplam alana sığıp sığmadığı doğrudan kontrol edilir.
+            # Paralel modda normal bölme uygulanır.
+            if self.orientation == "perpendicular":
+                n = 1
+            else:
+                n = max(1, int(round(gap_w / local_w)))
+                n = min(n, self.max_spaces_per_gap)
             y2 = int(min(h, base_bot))
-            y1 = int(max(0, base_bot - local_h))
+            if self.orientation == "perpendicular" and not _perp_side:
+                # Ön görünümde slot yüksekliği ignore_top sınırına kadar uzar;
+                # bu sayede çerçevenin tamamını kaplamaz.
+                top_limit = self.ignore_top_ratio * h
+                y1 = int(max(top_limit, base_bot - local_h))
+            else:
+                y1 = int(max(0, base_bot - local_h))
             step = gap_w / n
             for j in range(n):
                 sx1 = int(gap_x1 + j * step)
                 sx2 = int(gap_x1 + (j + 1) * step)
-                # Slot en-boy oranı: yan görüş için 0.25-6.0 aralığı dışı
-                # son derece dar veya çok geniş kutular sahte pozitiftir.
                 slot_w = sx2 - sx1
                 slot_h = y2 - y1
-                if slot_h > 0 and not (0.25 <= slot_w / slot_h <= 6.0):
-                    continue
+                # Ön görünüm dik park: slot dikey ağırlıklı olmalı (portrait)
+                if self.orientation == "perpendicular" and not _perp_side:
+                    if slot_h > 0 and not (0.15 <= slot_w / slot_h <= 2.5):
+                        continue
+                else:
+                    if slot_h > 0 and not (0.25 <= slot_w / slot_h <= 6.0):
+                        continue
                 slot = (sx1, y1, sx2, y2)
                 if self._slot_blocked(slot, obstacles):
                     continue
@@ -545,7 +575,7 @@ class StreetParkingDetector:
             local_w = width_at(mid_x)
             local_h = height_at(mid_x)
 
-            if gap_w < self.min_gap_ratio * local_w:
+            if gap_w < eff_min_gap * local_w:
                 continue
             if gap_w > self.max_gap_ratio * local_w:
                 continue
@@ -582,6 +612,17 @@ class StreetParkingDetector:
         if not candidates and detections:
             candidates = self._filter_candidates(frame.shape, detections, None)
         rows       = self._cluster_rows(candidates)
+
+        # Dik mod: görüş açısını otomatik tespit et
+        # bw/bh > 1.8 → yan görünüm (araçların yan yüzü kameraya dönük)
+        # bw/bh ≤ 1.8 → ön/arka görünüm (araçların ön yüzü kameraya dönük)
+        self._perp_side_view = False
+        if self.orientation == "perpendicular":
+            all_boxes = [b for r in rows for b in r]
+            if all_boxes:
+                ratios = [(b[2]-b[0]) / max(1, b[3]-b[1]) for b in all_boxes]
+                # 1.6: çapraz açılarda ön/yan karışık görünümü daha doğru ayırt eder
+                self._perp_side_view = float(np.median(ratios)) > 1.6
 
         # Yol yüzeyi öncelik sırası:
         #   1) external_road_mask (YOLOPv2 drivable area — en güvenilir)
@@ -663,6 +704,7 @@ class StreetParkingDetector:
         static_mask: list[bool] | None = None,
         external_road_mask: np.ndarray | None = None,
         ref_car_length_m: float = 4.5,
+        ref_car_width_m: float  = 2.0,
     ) -> dict:
         raw_empty, parked, rows = self._detect_raw(
             frame, detections, obstacles or [], static_mask,
@@ -670,8 +712,15 @@ class StreetParkingDetector:
         )
         confirmed = self._confirm(raw_empty)
 
-        # Ölçek tahmini ve slot boyutları (metre cinsinden)
-        scale = self.estimate_scale(rows, ref_car_length_m)
+        # Ölçek referansı seçimi:
+        # - Paralel mod: araç uzunluğu (yan görünümde bbox genişliği ≈ araç uzunluğu)
+        # - Dik-yan görünüm: araç uzunluğu (bbox genişliği yine araç uzunluğu)
+        # - Dik-ön görünüm: araç eni (bbox genişliği ≈ araç eni)
+        if self.orientation == "perpendicular" and not getattr(self, "_perp_side_view", False):
+            ref_dim = ref_car_width_m
+        else:
+            ref_dim = ref_car_length_m
+        scale = self.estimate_scale(rows, ref_dim)
         slot_sizes_m: list[tuple[float, float]] = []
         for (x1, y1, x2, y2) in confirmed:
             if scale is not None:
@@ -691,6 +740,7 @@ class StreetParkingDetector:
             "obstacles":      obstacles or [],
             "slot_sizes_m":   slot_sizes_m,   # [(uzunluk_m, derinlik_m), ...]
             "scale_m_per_px": scale,           # None = kalibre edilemedi
+            "perp_side_view": getattr(self, "_perp_side_view", False),
         }
 
     def draw(

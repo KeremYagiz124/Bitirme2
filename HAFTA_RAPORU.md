@@ -1,67 +1,67 @@
 Proje Adı: Kamera Görüntülerinden Araç Tespiti ve Park Uygunluğu Analizi için Yapay Zeka Tabanlı Sistem
-Rapor 6
+Rapor 7
 
 
-1. PARK SÜRESİ TAKİBİ
+1. DİK PARK İÇİN DESTEK EKLENDİ
 
-Video ve kamera modunda her araç için park süresinin anlık olarak görüntülenmesini sağlayan özellik geliştirildi.
+Otopark doluluğunu görüntüden tespit eden çalışmalar literatürde derin öğrenme ile yapılmaktadır [1]. Bu proje de aynı yaklaşımı temel almakta, ancak farklı park düzenlerini desteklemeyi hedeflemektedir.
 
-A. VehicleTracker Genişletmesi (src/detection/vehicle_tracker.py)
+Sistem bu rapora kadar yalnızca paralel parkı tanıyordu, yani araçların yol kenarına yan yana dizildiği sokak parkını. Bu hafta dik park desteği de eklendi. Dik park, araçların yola dik şekilde park ettiği otoparklardaki düzendir.
 
-- _Track sınıfına first_seen zaman damgası eklendi; araç ilk tespit edildiği anda kaydedilir
-- get_static_tracks_with_duration() metodu eklendi: statik araçları (bbox, süre_sn) çiftleri olarak döndürür
+Bunun için araç tespitinde kullanılan YOLO [2] sisteminin bulduğu araç kutularını dik park mantığına göre yeniden değerlendiren bir yapı kuruldu. Araç tespit modülüne "yön" adında bir ayar eklendi: paralel ya da dik. Kullanıcı arayüzdeki butondan hangi park türünü analiz etmek istediğini seçmekte, sistem de buna göre çalışmaktadır.
 
-B. Arayüz Entegrasyonu
-
-- Her statik aracın bbox'ı üzerine M:SS formatında süre etiketi çiziliyor (koyu arka plan üzerinde sarı yazı)
-- Yalnızca video/kamera modunda aktif; fotoğraf modunda gösterilmiyor
-- CSV log çıktısına longest_parked_sec sütunu eklendi: o anki en uzun süre park eden araç süresi
-
-C. Snapshot İyileştirmesi
-
-- Snapshot alınırken görüntü yeniden işlenmek yerine önbellekteki son analiz sonucu (_last_result) kullanılıyor
-- Sokak modunda draw() mevcut sonuçla çağrılıyor; sabit kamera modunda önceki davranış korunuyor
+Paralel modda araçlar yatay (geniş) görünür, bu nedenle çok ince kutular araç olarak sayılmaz. Dik modda ise araçlar hem önden hem yandan görünebildiği için bu filtre gevşetildi; böylece dik duran araçlar da gözden kaçırılmaz.
 
 
-2. SOKAK MODU DOĞRULUK KALİBRASYONU
+2. FOTOĞRAFIN AÇISI OTOMATİK OLARAK BELİRLENİYOR
 
-A. Parametre Optimizasyonu
+Dik park fotoğrafları çekim açısına göre iki türlü gelebilmektedir: araçların önüne bakan açı (ön görünüm) ya da yanına bakan açı (yan görünüm). Bu iki durum farklı hesaplama gerektirdiği için sistemin açıyı kendi kendine belirlemesi gerekmekteydi.
 
-max_edge_extension_ratio parametresi 0.40'tan 0.20'ye düşürüldü. Bu parametre çerçeve kenarındaki son araçtan ne kadar ötesine slot uzatılacağını belirler. Varsayılan değer geniş kenar boşluklarını fazladan slot olarak bölüyordu.
-
-B. Değerlendirme Sonuçları
-
-3 görüntülük ground truth veri setiyle gerçekleştirilen değerlendirme:
-
-| Görüntü | Beklenen Boş | Tespit | TP | FP | FN |
-|---|---|---|---|---|---|
-| 1.png | 0 | 0 | 0 | 0 | 0 |
-| 2.png | 2 | 2 | 2 | 0 | 0 |
-| 3.png | 3 | 3 | 3 | 0 | 0 |
-
-Mikro F1: %100.0 (önceki rapor: %90.9)
-
-Önceki raporda 3.png görüntüsünde çerçeve sağ kenarındaki 747 piksellik boşluk 3 slota bölünüyordu (beklenen: 2). Yeni parametre sınırı bu uzantıyı kesiyor ve yalnızca 2 slot üretiyor.
+Bu sorun şöyle çözüldü: fotoğraftaki araç kutularının ortalama en-boy oranına bakılmaktadır. Kutular genişse (oran 1.6'dan büyük) araçlara yandan bakıldığı, kutular kareye yakınsa araçlara önden bakıldığı anlaşılmaktadır. Karar sistem tarafından otomatik verilmekte ve sonuç arayüzde "Yan gorunum aktif" veya "On gorunum aktif" yazısıyla kullanıcıya gösterilmektedir. Böylece kullanıcı sistemin neye göre ölçüm yaptığını görebilmektedir.
 
 
-3. OTOMATİK PARK TESPİTİ MOD YENİDEN ADLANDIRMASI
+3. GERÇEK BOYUT DOĞRU ŞEKİLDE HESAPLANIYOR
 
-"Sokak Modu" UI etiketi "Otomatik Park Tespiti" olarak güncellendi. Mevcut StreetParkingDetector algoritması yalnızca sokak parkı değil, herhangi bir açıdan çekilen otopark görüntülerinde de çalışabilmektedir (multi_row=True). Yeniden adlandırma sistemin yeni ortamlara uyarlanabilirliğini yansıtmaktadır.
+Sistem bir alanın kaç metre olduğunu doğrudan bilemez; bu değer, fotoğraftaki park etmiş araçların piksel boyutunun bilinen gerçek bir ölçüyle kıyaslanmasıyla tahmin edilmektedir. Kullanılan ölçü, fotoğrafın açısına göre değişmektedir:
+
+- Paralel parkta ve dik-yan görünümde: araç uzunluğu (yaklaşık 4.5 metre) referans alınır, çünkü bu açılarda araç kutusunun genişliği aracın uzunluğuna denk gelir.
+- Dik-ön görünümde: araç eni (yaklaşık 2.0 metre) referans alınır, çünkü önden bakıldığında araç kutusunun genişliği aracın enine denk gelir.
+
+Önemli bir düzeltme olarak boş alanların parçalara bölünmesi uygulamasından vazgeçildi. Önceki sürümde büyük bir boş alan araç eni kadar parçalara bölünüyor ve her parça ayrı ayrı "sığmaz" olarak gösteriliyordu. Artık dik modda boş alan tek parça olarak ölçülmekte ve kullanıcının aracının o alana girip giremeyeceğine toplam genişliğe göre karar verilmektedir.
+
+
+4. ARAYÜZ KULLANIMI KOLAYLAŞTIRILDI
+
+Araç boyutu giriş kutuları seçilen moda göre değiştirildi. Paralel moddayken kullanıcı "araç uzunluğu" girmekte, dik moda geçildiğinde bu kutu gizlenip yerine "araç eni" kutusu çıkmaktadır. Böylece kullanıcıya yalnızca o an işine yarayan bilgi gösterilmekte, karışıklık önlenmektedir.
+
+Boş alanların ekrana çizilmesi, etiketlerin yazılması ve fotoğrafların kaydedilmesi gibi tüm görüntü işlemlerinde OpenCV [3] kütüphanesi kullanıldı. Ayrıca aracın sığıp sığmadığının kontrol edildiği tüm yerler (ekrandaki çizim, etiket yazısı, uyarı mesajı ve kaydedilen fotoğraf) tek tip hale getirildi: dik modda araç eni, paralel modda araç uzunluğu kullanılmaktadır. Bu sayede hangi ekrana bakılırsa bakılsın aynı sonuç görülmektedir.
+
+
+5. YENİ TESTLER YAZILDI
+
+Eklenen dik park özelliğinin doğru çalıştığından emin olmak için test paketine on yeni test eklendi. Bu testler şunları kontrol etmektedir:
+
+- Sistem fotoğrafın açısını (ön mü yan mı) doğru belirliyor mu
+- Dik modda boş alan tek parça mı kalıyor, paralel modda parçalara bölünüyor mu
+- Gerçek boyut hesabında doğru referans (uzunluk ya da en) kullanılıyor mu
+- Yeni fotoğraf yüklendiğinde sistem önceki durumu sıfırlıyor mu
+
+Toplam test sayısı 51'den 61'e çıktı ve testlerin tamamı başarıyla geçmektedir.
+
+
+6. SİSTEMİN BİR SINIRI: ÇOK EĞİK AÇILAR
+
+Sistem fotoğraf üzerindeki araç kutuları üzerinden çalışmakta, yani iki boyutlu bir analiz yapmaktadır. Kamera tam karşıdan ya da yukarıdan bakmadığında, çok eğik açılarda, aynı hizada ama farklı uzaklıkta duran nesneler görüntüde üst üste binebilmektedir. Bu durumda boş alan ölçümü tam doğru olmamakta, yaklaşık kalmaktadır.
+
+Bu sorunun tamamen çözülmesi için fotoğrafı kuş bakışına çeviren bir dönüşüm ya da her pikselin uzaklığını tahmin eden ayrı bir derinlik modeli gerekmektedir. Her ikisi de kamera kalibrasyonu veya ağır ek modeller gerektirdiğinden bu projenin kapsamı dışındadır. Sistem düz ya da yukarıdan çekilmiş fotoğraflarda yüksek doğrulukla, çok eğik açılı fotoğraflarda ise yaklaşık sonuçla çalışmaktadır. Bu durum bir eksiklik olarak değil, bilinen bir çalışma koşulu olarak not edilmiştir.
 
 
 Rapor Özeti
 
-Bu hafta üç temel geliştirme gerçekleştirildi: Park süresi takibi ve log iyileştirmesi, sokak modu doğruluk kalibrasyonu ile mod yeniden adlandırması. Sokak modunda boş alan tespiti %100 Mikro F1'e ulaştı. Sistem sunum ve demo olgunluğuna erişmiştir.
+Bu hafta sisteme dik park desteği eklendi. Artık hem paralel hem dik park alanları analiz edilebilmektedir. Sistem fotoğrafın açısını kendisi belirlemekte, gerçek boyutu doğru referansla hesaplamakta ve boş alanı bölmeden tek parça değerlendirmektedir. Arayüz seçilen moda göre sadeleştirildi, on yeni testle birlikte test sayısı 61'e ulaştı. Çok eğik açılı fotoğraflardaki ölçüm sınırı da raporda açıkça belirtildi.
 
 
 Kullanılan Kaynaklar
-1. Jocher, G. et al. (2023). Ultralytics YOLOv8. https://github.com/ultralytics/ultralytics
-2. OpenCV Documentation. https://opencv.org
-3. Wang, H. et al. (2022). YOLOPv2: Better, Faster, Stronger for Panoptic Driving Perception. arXiv:2208.11434
-4. Redmon, J. & Farhadi, A. (2018). YOLOv3: An Incremental Improvement. arXiv:1804.02767
-5. Bradski, G. (2000). The OpenCV Library. Dr. Dobb's Journal of Software Tools, 25(11), 120–125.
-6. Lucas, B. D. & Kanade, T. (1981). An Iterative Image Registration Technique with an Application to Stereo Vision. IJCAI, 674–679.
-7. Shi, J. & Tomasi, C. (1994). Good Features to Track. IEEE CVPR, 593–600.
-8. Amato, G. et al. (2017). Deep Learning for Decentralized Parking Lot Occupancy Detection. Expert Systems with Applications, 72, 327–334.
-9. Nurullayev, S. & Lee, S. W. (2019). Generalized Parking Occupancy Analysis Based on Squeeze-and-Excitation Networks. Sensors, 19(3), 480.
-10. Bochkovskiy, A., Wang, C. Y., & Liao, H. Y. M. (2020). YOLOv4: Optimal Speed and Accuracy of Object Detection. arXiv:2004.10934
+[1] Amato, G. ve diğerleri (2017). Deep Learning for Decentralized Parking Lot Occupancy Detection. Expert Systems with Applications, 72, 327–334.
+[2] Jocher, G., Chaurasia, A. ve Qiu, J. (2023). Ultralytics YOLOv8 https://github.com/ultralytics/ultralytics
+[3] Bradski, G. (2000). The OpenCV Library. Dr. Dobb's Journal of Software Tools, 25(11), 120–125.

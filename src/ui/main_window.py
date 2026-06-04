@@ -101,6 +101,9 @@ class MainWindow(QWidget):
         # Araç sığma kontrolü için boyutlar (metre)
         self._ref_car_length_m  = 4.5   # ölçek kalibrasyonu için referans araç uzunluğu
         self._user_car_length_m = 4.5   # kullanıcının aracının uzunluğu
+        self._perp_mode         = False  # dik park modu
+        self._ref_car_width_m   = 2.0   # dik modda ölçek referansı (araç eni)
+        self._user_car_width_m  = 2.0   # kullanıcı aracının eni
         self._alert_occ_threshold = 80  # doluluk uyarı eşiği (%)
 
         self.street_detector: StreetParkingDetector | None = None
@@ -257,6 +260,62 @@ class MainWindow(QWidget):
             strip_layout, "Yok:", 0, 60, int(self._ignore_top_ratio * 100),
             lambda v: self._set_ignore_top(v)
         )
+
+        # Park yönü seçici
+        _s_act = ("background:#0e7490; color:#fff; border-radius:4px;"
+                  " font-size:10px; font-weight:bold; padding:2px 6px; border:none;")
+        _s_ina = ("background:#1e293b; color:#94a3b8; border-radius:4px;"
+                  " font-size:10px; padding:2px 6px; border:1px solid #334155;")
+        orient_row = QHBoxLayout()
+        orient_lbl = QLabel("Yön:")
+        orient_lbl.setStyleSheet("color:#94a3b8; font-size:11px;")
+        orient_lbl.setFixedWidth(32)
+        self._btn_par = QPushButton("Paralel")
+        self._btn_par.setFixedHeight(22)
+        self._btn_par.setStyleSheet(_s_act)
+        self._btn_dik = QPushButton("Dik")
+        self._btn_dik.setFixedHeight(22)
+        self._btn_dik.setStyleSheet(_s_ina)
+
+        def _set_par():
+            self._perp_mode = False
+            self._btn_par.setStyleSheet(_s_act)
+            self._btn_dik.setStyleSheet(_s_ina)
+            self._ref_len_w.setVisible(True)
+            self._ref_wid_w.setVisible(False)
+            self._usr_len_w.setVisible(True)
+            self._usr_wid_w.setVisible(False)
+            self._view_lbl.setVisible(False)
+            if self._street_mode:
+                self._rebuild_street_detector()
+            if self._last_frame is not None and self.cap is None:
+                self._process_and_show(self._last_frame)
+
+        def _set_dik():
+            self._perp_mode = True
+            self._btn_par.setStyleSheet(_s_ina)
+            self._btn_dik.setStyleSheet(_s_act)
+            self._ref_len_w.setVisible(False)
+            self._ref_wid_w.setVisible(True)
+            self._usr_len_w.setVisible(False)
+            self._usr_wid_w.setVisible(True)
+            self._view_lbl.setVisible(True)
+            if self._street_mode:
+                self._rebuild_street_detector()
+            if self._last_frame is not None and self.cap is None:
+                self._process_and_show(self._last_frame)
+
+        self._btn_par.clicked.connect(_set_par)
+        self._btn_dik.clicked.connect(_set_dik)
+        orient_row.addWidget(orient_lbl)
+        orient_row.addWidget(self._btn_par)
+        orient_row.addWidget(self._btn_dik)
+        strip_layout.addLayout(orient_row)
+
+        self._view_lbl = QLabel("")
+        self._view_lbl.setStyleSheet("color:#64748b; font-size:9px; padding-left:2px;")
+        self._view_lbl.setVisible(False)
+        strip_layout.addWidget(self._view_lbl)
         panel.addWidget(strip_box)
 
         # ── Araç Sığma Kontrolü ──
@@ -272,11 +331,14 @@ class MainWindow(QWidget):
         fit_lbl.setStyleSheet("color:#4ade80; font-size:11px; font-weight:bold;")
         fit_layout.addWidget(fit_lbl)
 
-        def _spin(label_text, value, min_v, max_v, callback):
-            row = QHBoxLayout()
+        def _spin_w(label_text, value, min_v, max_v, callback):
+            w = QWidget()
+            w.setStyleSheet("background:transparent;")
+            row = QHBoxLayout(w)
+            row.setContentsMargins(0, 0, 0, 0)
             lbl = QLabel(label_text)
             lbl.setStyleSheet("color:#94a3b8; font-size:11px;")
-            lbl.setFixedWidth(90)
+            lbl.setFixedWidth(110)
             spin = QDoubleSpinBox()
             spin.setRange(min_v, max_v)
             spin.setSingleStep(0.1)
@@ -292,16 +354,31 @@ class MainWindow(QWidget):
             row.addWidget(lbl)
             row.addWidget(spin)
             row.addStretch()
-            fit_layout.addLayout(row)
+            return w
 
-        _spin("Ref. araç uzunluğu:", self._ref_car_length_m, 2.0, 8.0,
-              lambda v: setattr(self, "_ref_car_length_m", v) or
-              (self._last_frame is not None and self.cap is None and
-               self._process_and_show(self._last_frame)))
-        _spin("Aracın uzunluğu:", self._user_car_length_m, 2.0, 8.0,
-              lambda v: setattr(self, "_user_car_length_m", v) or
-              (self._last_frame is not None and self.cap is None and
-               self._process_and_show(self._last_frame)))
+        def _reprocess():
+            if self._last_frame is not None and self.cap is None:
+                self._process_and_show(self._last_frame)
+
+        self._ref_len_w = _spin_w(
+            "Ref. araç uzunluğu:", self._ref_car_length_m, 2.0, 8.0,
+            lambda v: setattr(self, "_ref_car_length_m", v) or _reprocess())
+        self._ref_wid_w = _spin_w(
+            "Ref. araç eni:", self._ref_car_width_m, 1.0, 4.0,
+            lambda v: setattr(self, "_ref_car_width_m", v) or _reprocess())
+        self._usr_len_w = _spin_w(
+            "Aracın uzunluğu:", self._user_car_length_m, 2.0, 8.0,
+            lambda v: setattr(self, "_user_car_length_m", v) or _reprocess())
+        self._usr_wid_w = _spin_w(
+            "Aracın eni:", self._user_car_width_m, 1.0, 4.0,
+            lambda v: setattr(self, "_user_car_width_m", v) or _reprocess())
+
+        fit_layout.addWidget(self._ref_len_w)
+        fit_layout.addWidget(self._ref_wid_w)
+        fit_layout.addWidget(self._usr_len_w)
+        fit_layout.addWidget(self._usr_wid_w)
+        self._ref_wid_w.setVisible(False)
+        self._usr_wid_w.setVisible(False)
 
 
         fit_info = QLabel("Yeşil = Sığar  |  Kırmızı = Sığmaz")
@@ -538,21 +615,40 @@ class MainWindow(QWidget):
 
     def _rebuild_street_detector(self):
         """Street detector'ı tüm iyileştirilmiş parametrelerle yeniden oluştur."""
-        self.street_detector = StreetParkingDetector(
-            min_gap_ratio=self._min_gap_ratio,
-            row_band_ratio=self._row_band_ratio,
-            ignore_top_ratio=self._ignore_top_ratio,
-            # İyileştirilmiş sabit parametreler
-            bottom_align_tol=0.35,
-            lateral_split_ratio=3.5,
-            max_gap_ratio=5.0,
-            max_spaces_per_gap=3,
-            max_edge_extension_ratio=0.20,
-            road_center_reject_ratio=0.0,
-            road_color_tol_h=35.0,
-            road_color_tol_s=80.0,
-            road_color_tol_v=80.0,
-        )
+        if self._perp_mode:
+            self.street_detector = StreetParkingDetector(
+                min_gap_ratio=self._min_gap_ratio,
+                row_band_ratio=self._row_band_ratio,
+                ignore_top_ratio=self._ignore_top_ratio,
+                # Dik park optimizasyonları
+                bottom_align_tol=0.65,      # ön görüşte dikey hizalama toleranslı
+                lateral_split_ratio=4.0,
+                max_gap_ratio=4.0,
+                max_spaces_per_gap=4,
+                max_edge_extension_ratio=0.25,
+                road_center_reject_ratio=0.0,
+                road_color_tol_h=40.0,
+                road_color_tol_s=90.0,
+                road_color_tol_v=90.0,
+                orientation="perpendicular",
+            )
+        else:
+            self.street_detector = StreetParkingDetector(
+                min_gap_ratio=self._min_gap_ratio,
+                row_band_ratio=self._row_band_ratio,
+                ignore_top_ratio=self._ignore_top_ratio,
+                # Paralel park optimizasyonları
+                bottom_align_tol=0.35,
+                lateral_split_ratio=3.5,
+                max_gap_ratio=5.0,
+                max_spaces_per_gap=3,
+                max_edge_extension_ratio=0.20,
+                road_center_reject_ratio=0.0,
+                road_color_tol_h=35.0,
+                road_color_tol_s=80.0,
+                road_color_tol_v=80.0,
+                orientation="parallel",
+            )
 
     def _set_min_gap(self, v):
         self._min_gap_ratio = v / 100
@@ -621,14 +717,23 @@ class MainWindow(QWidget):
                  "tamamen yok sayılır. Yanlış araç tespitini önler."),
             ]),
             ("ARAÇ SIĞMA KONTROLÜ", "#166534", [
-                ("Ref. Araç Uzunluğu",
-                 "Görüntüdeki park etmiş araçların gerçek dünya uzunluğu tahmini (metre). "
-                 "Bu değer piksel → metre dönüşüm ölçeğini belirler. "
+                ("Park Yönü (Paralel / Dik)",
+                 "Paralel: Araçlar sokak boyunca sıralanmış, yan kamera görüşü. "
+                 "Dik: Araçlar yola dik dizilmiş (otopark tipi). "
+                 "Sistem görüntüdeki araçların en-boy oranına göre yan/ön görünümü "
+                 "otomatik ayırt eder ve bunu etiketle bildirir."),
+                ("Ref. Araç Uzunluğu (Paralel mod)",
+                 "Görüntüdeki park etmiş araçların gerçek uzunluk tahmini (metre). "
+                 "Bu değer piksel → metre ölçeğini belirler. "
                  "Standart otomobil için 4.0–4.8m uygundur."),
-                ("Aracın Uzunluğu",
-                 "Sizin aracınızın uzunluğu (metre). "
-                 "Tespit edilen boş alanlar bu değerden büyükse YEŞİL (SIĞAR), "
-                 "küçükse KIRMIZI (SIĞMAZ) olarak işaretlenir."),
+                ("Ref. Araç Eni (Dik mod)",
+                 "Dik park modunda ölçek referansı olarak kullanılan araç eni (metre). "
+                 "Ön görünüm için 1.8–2.0m uygundur. "
+                 "Yan görünümde sistem ref. araç uzunluğunu otomatik kullanır."),
+                ("Aracın Uzunluğu / Eni",
+                 "Sizin aracınızın boyutu (metre). "
+                 "Paralel modda uzunluk, dik modda en karşılaştırılır. "
+                 "Sığan alanlar YEŞİL, sığmayanlar KIRMIZI gösterilir."),
             ]),
             ("UYARI EŞİĞİ", "#7c3aed", [
                 ("Doluluk Eşiği",
@@ -772,9 +877,10 @@ class MainWindow(QWidget):
         # Son işlenmiş kareyi tekrar çizmek yerine mevcut analiz sonucunu kullan
         frame = self._last_frame.copy()
         if self._street_mode and self.street_detector and self._last_result is not None:
+            car_dim = self._user_car_width_m if self._perp_mode else self._user_car_length_m
             frame = self.street_detector.draw(
                 frame, self._last_result,
-                car_length_m=self._user_car_length_m,
+                car_length_m=car_dim,
             )
         elif self.analyzer and self.detector:
             dets = self.detector.detect(frame)
@@ -1120,6 +1226,7 @@ class MainWindow(QWidget):
                     static_mask=static_mask,
                     external_road_mask=self._last_drivable_mask,
                     ref_car_length_m=self._ref_car_length_m,
+                    ref_car_width_m=self._ref_car_width_m,
                 )
 
                 # Occupancy heatmap güncelle (ego-motion ile kaydırılarak)
@@ -1174,6 +1281,14 @@ class MainWindow(QWidget):
                 result = self._last_result
                 learned_status = self._last_learned_status
 
+            # Dik mod görünüm açısı etiketi
+            if self._perp_mode and result is not None:
+                side = result.get("perp_side_view", False)
+                self._view_lbl.setText(
+                    "Yan gorunum aktif (ref. uzunluk)" if side
+                    else "On gorunum aktif (ref. en)"
+                )
+
             # Çizim katmanları — heuristic boş slot'lar confidence-aware
             empty_spaces = result.get("empty_spaces", [])
             confs        = result.get("slot_confidences",
@@ -1189,7 +1304,8 @@ class MainWindow(QWidget):
                     x1, y1, x2, y2 = map(int, s)
                     if check_fit and i < len(sizes_m):
                         w_m = sizes_m[i][0]
-                        fits = w_m >= self._user_car_length_m
+                        dim = self._user_car_width_m if self._perp_mode else self._user_car_length_m
+                        fits = w_m >= dim
                         color = COLOR_FIT if fits else COLOR_NOFIT
                     else:
                         color = COLOR_FIT
@@ -1201,7 +1317,8 @@ class MainWindow(QWidget):
                     x1, y1, x2, y2 = map(int, s)
                     if check_fit and i < len(sizes_m):
                         w_m = sizes_m[i][0]
-                        fits = w_m >= self._user_car_length_m
+                        dim = self._user_car_width_m if self._perp_mode else self._user_car_length_m
+                        fits = w_m >= dim
                         color = COLOR_FIT if fits else COLOR_NOFIT
                         label = f"{'SIGAR' if fits else 'SIGMAZ'} {w_m:.1f}m"
                     else:
@@ -1271,9 +1388,10 @@ class MainWindow(QWidget):
                 self.occupancy_lbl.setText("Arac tespit edilemedi")
             self._alerts.check_occupancy(available, occupied, self._alert_occ_threshold)
             if check_fit and empty_spaces:
+                dim = self._user_car_width_m if self._perp_mode else self._user_car_length_m
                 fit_count = sum(
                     1 for i, s in enumerate(empty_spaces)
-                    if i < len(sizes_m) and sizes_m[i][0] >= self._user_car_length_m
+                    if i < len(sizes_m) and sizes_m[i][0] >= dim
                 )
                 self._alerts.check_no_fit(fit_count, len(empty_spaces))
             for cls_id, card in self.stat_cards.items():

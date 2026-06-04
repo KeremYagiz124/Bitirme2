@@ -532,3 +532,195 @@ class TestCameraSimulation:
         for _ in range(10):
             tracker.update([], frame)
         assert len(tracker.get_static_tracks()) == 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Dik Park Modu testleri
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _perp_det_front(x1, y1, x2, y2):
+    """Ön görünüm dik park: araç kareye yakın (bw/bh ≈ 1.2)."""
+    return {"bbox": [x1, y1, x2, y2], "class_id": 2, "confidence": 0.9}
+
+
+def _perp_det_side(x1, y1, x2, y2):
+    """Yan görünüm dik park: araç geniş (bw/bh ≈ 3.0)."""
+    return {"bbox": [x1, y1, x2, y2], "class_id": 2, "confidence": 0.9}
+
+
+class TestPerpendiculaMode:
+    """Dik park (perpendicular) modu birim testleri."""
+
+    # ── Görünüm açısı tespiti ─────────────────────────────────────
+
+    def test_front_view_detected_square_cars(self):
+        """Kareye yakın bboxlar (bw/bh ≈ 1.2) → ön görünüm."""
+        frame = _blank(800, 400)
+        # 3 araç, her biri 100×80 px (bw/bh=1.25)
+        dets = [
+            _perp_det_front(50, 150, 150, 230),
+            _perp_det_front(200, 150, 300, 230),
+            _perp_det_front(350, 150, 450, 230),
+        ]
+        det = StreetParkingDetector(
+            orientation="perpendicular",
+            smoothing_frames=1, smoothing_min_hits=1,
+            road_color_check=False,
+        )
+        result = det.analyze(frame, dets)
+        assert result["perp_side_view"] is False
+
+    def test_side_view_detected_wide_cars(self):
+        """Geniş bboxlar (bw/bh ≈ 3.0) → yan görünüm."""
+        frame = _blank(1200, 400)
+        # 3 araç, her biri 300×100 px (bw/bh=3.0)
+        dets = [
+            _perp_det_side(50,  150, 350, 250),
+            _perp_det_side(400, 150, 700, 250),
+            _perp_det_side(750, 150, 1050, 250),
+        ]
+        det = StreetParkingDetector(
+            orientation="perpendicular",
+            smoothing_frames=1, smoothing_min_hits=1,
+            road_color_check=False,
+        )
+        result = det.analyze(frame, dets)
+        assert result["perp_side_view"] is True
+
+    # ── Bölme yok (n=1) ──────────────────────────────────────────
+
+    def test_no_subdivision_large_gap(self):
+        """Dik modda büyük boşluk tek slot olarak raporlanmalı."""
+        frame = _blank(1000, 400)
+        # Tek araç ortada → her iki yanda büyük boşluk
+        dets = [_perp_det_front(400, 150, 550, 250)]
+        det = StreetParkingDetector(
+            orientation="perpendicular",
+            smoothing_frames=1, smoothing_min_hits=1,
+            road_color_check=False,
+            max_edge_extension_ratio=0.40,
+            min_gap_ratio=0.20,
+        )
+        result = det.analyze(frame, dets)
+        # Her boşluk tek slot olmalı — araç genişliğine bölünmemeli
+        for slot in result["empty_spaces"]:
+            x1, _, x2, _ = slot
+            # Slot genişliği = toplam boşluk, çok daha büyük olmalı
+            assert (x2 - x1) > 130  # araç genişliği (150px) den büyük
+
+    def test_parallel_mode_subdivides(self):
+        """Paralel modda aynı boşluk birden fazla slota bölünebilir."""
+        frame = _blank(1000, 400)
+        # 2 araç arası büyük boşluk (5× araç genişliği)
+        dets = [
+            _det(50, 150, 150, 250),   # araç genişliği 100px
+            _det(650, 150, 750, 250),  # 500px boşluk → ~5 slot
+        ]
+        det = StreetParkingDetector(
+            orientation="parallel",
+            smoothing_frames=1, smoothing_min_hits=1,
+            road_color_check=False,
+            max_spaces_per_gap=4,
+            min_gap_ratio=0.20,
+        )
+        result = det.analyze(frame, dets)
+        # Paralel modda büyük boşluk birden çok slota bölünmeli
+        assert result["empty_count"] >= 2
+
+    # ── Ölçek referansı ──────────────────────────────────────────
+
+    def test_scale_uses_width_ref_in_front_view(self):
+        """Ön görünümde ölçek ref_car_width_m'e göre hesaplanmalı."""
+        frame = _blank(800, 400)
+        dets = [
+            _perp_det_front(100, 150, 200, 230),  # 100px genişlik
+            _perp_det_front(350, 150, 450, 230),
+        ]
+        det = StreetParkingDetector(
+            orientation="perpendicular",
+            smoothing_frames=1, smoothing_min_hits=1,
+            road_color_check=False,
+        )
+        result = det.analyze(frame, dets, ref_car_width_m=2.0)
+        scale = result["scale_m_per_px"]
+        assert scale is not None
+        # scale = 2.0 / 100px = 0.02 m/px
+        assert abs(scale - 0.02) < 0.005
+
+    def test_scale_uses_length_ref_in_side_view(self):
+        """Yan görünümde ölçek ref_car_length_m'e göre hesaplanmalı."""
+        frame = _blank(1200, 400)
+        dets = [
+            _perp_det_side(50,  150, 350, 250),  # 300px genişlik
+            _perp_det_side(400, 150, 700, 250),
+        ]
+        det = StreetParkingDetector(
+            orientation="perpendicular",
+            smoothing_frames=1, smoothing_min_hits=1,
+            road_color_check=False,
+        )
+        result = det.analyze(frame, dets, ref_car_length_m=4.5)
+        scale = result["scale_m_per_px"]
+        assert scale is not None
+        # scale = 4.5 / 300px = 0.015 m/px
+        assert abs(scale - 0.015) < 0.003
+
+    # ── Sığma kontrolü ───────────────────────────────────────────
+
+    def test_slot_size_reported_in_meters(self):
+        """Slot boyutu metre cinsinden raporlanmalı."""
+        frame = _blank(1200, 400)
+        dets = [
+            _perp_det_side(50,  150, 350, 250),
+            _perp_det_side(750, 150, 1050, 250),
+        ]
+        det = StreetParkingDetector(
+            orientation="perpendicular",
+            smoothing_frames=1, smoothing_min_hits=1,
+            road_color_check=False,
+        )
+        result = det.analyze(frame, dets, ref_car_length_m=4.5)
+        if result["empty_count"] > 0:
+            w_m, h_m = result["slot_sizes_m"][0]
+            assert w_m > 0
+            assert h_m >= 0
+
+    # ── result dict anahtarları ───────────────────────────────────
+
+    def test_result_has_perp_side_view_key(self):
+        frame = _blank(800, 400)
+        dets = [_perp_det_front(200, 150, 350, 270)]
+        det = StreetParkingDetector(
+            orientation="perpendicular",
+            smoothing_frames=1, smoothing_min_hits=1,
+            road_color_check=False,
+        )
+        result = det.analyze(frame, dets)
+        assert "perp_side_view" in result
+        assert isinstance(result["perp_side_view"], bool)
+
+    def test_parallel_result_no_perp_flag(self):
+        """Paralel modda perp_side_view False olmalı (default)."""
+        frame = _blank(800, 400)
+        dets = [_det(100, 200, 300, 320), _det(400, 200, 600, 320)]
+        det = StreetParkingDetector(
+            smoothing_frames=1, smoothing_min_hits=1,
+            road_color_check=False,
+        )
+        result = det.analyze(frame, dets)
+        assert result.get("perp_side_view") is False
+
+    # ── reset_history ─────────────────────────────────────────────
+
+    def test_reset_clears_perp_state(self):
+        """reset_history sonrası perp_side_view False'a dönmeli."""
+        frame = _blank(1200, 400)
+        dets = [_perp_det_side(50, 150, 350, 250)]
+        det = StreetParkingDetector(
+            orientation="perpendicular",
+            smoothing_frames=1, smoothing_min_hits=1,
+            road_color_check=False,
+        )
+        det.analyze(frame, dets)
+        det.reset_history()
+        assert getattr(det, "_perp_side_view", False) is False
