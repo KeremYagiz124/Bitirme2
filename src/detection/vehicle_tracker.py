@@ -28,35 +28,52 @@ def _iou(a, b) -> float:
 
 
 class _Track:
-    __slots__ = ("id", "bbox", "history", "misses", "frames_seen", "first_seen")
+    __slots__ = ("id", "bbox", "history", "misses", "frames_seen", "first_seen", "class_id", "confidence", "duration")
 
-    def __init__(self, tid: int, bbox, history_len: int):
+    def __init__(self, tid: int, bbox, history_len: int, class_id: int, confidence: float):
         self.id          = tid
         self.bbox        = bbox
         self.history     = deque([self._center(bbox)], maxlen=history_len)
         self.misses      = 0
         self.frames_seen = 1
         self.first_seen  = time.time()
+        self.class_id    = class_id
+        self.confidence  = confidence
+        self.duration    = 0.0
 
     @staticmethod
     def _center(b):
         return ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0)
 
-    def update(self, bbox):
+    def update(self, bbox, confidence: float, dt: float = 0.0):
         self.bbox = bbox
         self.history.append(self._center(bbox))
         self.misses = 0
         self.frames_seen += 1
+        self.confidence = confidence
+        self.duration += dt
 
     def miss(self):
         self.misses += 1
 
-    def is_static(self, min_history: int, max_disp_ratio: float) -> bool:
-        if len(self.history) < min_history:
-            return False
-        xs = [p[0] for p in self.history]
-        ys = [p[1] for p in self.history]
-        disp = ((max(xs) - min(xs)) ** 2 + (max(ys) - min(ys)) ** 2) ** 0.5
+    def is_static(self, min_history: int, max_disp_ratio: float, check_window: int = 15) -> bool:
+        history_to_use = list(self.history)[-check_window:]
+        if len(history_to_use) < min_history:
+            return False  # Require min_history to confirm state (tests require False initially)
+        xs = [p[0] for p in history_to_use]
+        ys = [p[1] for p in history_to_use]
+        
+        # Trim outliers: remove the top and bottom 10% of coordinates to handle YOLO jitter robustly.
+        n_trim = int(len(history_to_use) * 0.10)
+        if n_trim > 0 and len(history_to_use) - 2 * n_trim >= min_history:
+            xs_sorted = sorted(xs)
+            ys_sorted = sorted(ys)
+            xs_trimmed = xs_sorted[n_trim:-n_trim]
+            ys_trimmed = ys_sorted[n_trim:-n_trim]
+            disp = ((max(xs_trimmed) - min(xs_trimmed)) ** 2 + (max(ys_trimmed) - min(ys_trimmed)) ** 2) ** 0.5
+        else:
+            disp = ((max(xs) - min(xs)) ** 2 + (max(ys) - min(ys)) ** 2) ** 0.5
+            
         ref = max(self.bbox[2] - self.bbox[0], self.bbox[3] - self.bbox[1])
         if ref <= 0:
             return False
@@ -109,23 +126,34 @@ class VehicleTracker:
         """
         if frame is None or not self.ego_motion:
             return 0.0, 0.0
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        h, w = frame.shape[:2]
+        # Target width of 320px reduces pixel operations by ~9x compared to 960px
+        target_w = 320
+        scale = target_w / float(w)
+        target_h = int(h * scale)
+
+        small_frame = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+        gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
+        
         if self._prev_gray is None or self._prev_gray.shape != gray.shape:
             self._prev_gray = gray
             return 0.0, 0.0
 
         # Araç bbox'larını mask ile dışla
-        h, w = gray.shape
-        mask = np.full((h, w), 255, dtype=np.uint8)
+        h_s, w_s = gray.shape
+        mask = np.full((h_s, w_s), 255, dtype=np.uint8)
         for b in ignore_boxes:
-            x1 = max(0, int(b[0])); y1 = max(0, int(b[1]))
-            x2 = min(w, int(b[2])); y2 = min(h, int(b[3]))
+            x1 = max(0, int(b[0] * scale))
+            y1 = max(0, int(b[1] * scale))
+            x2 = min(w_s, int(b[2] * scale))
+            y2 = min(h_s, int(b[3] * scale))
             if x2 > x1 and y2 > y1:
                 mask[y1:y2, x1:x2] = 0
 
         pts0 = cv2.goodFeaturesToTrack(
             self._prev_gray, maxCorners=self.ego_max_features,
-            qualityLevel=0.01, minDistance=12, mask=mask, blockSize=5,
+            qualityLevel=0.01, minDistance=6, mask=mask, blockSize=5,
         )
         if pts0 is None or len(pts0) < 8:
             self._prev_gray = gray
@@ -133,7 +161,7 @@ class VehicleTracker:
 
         pts1, status, _ = cv2.calcOpticalFlowPyrLK(
             self._prev_gray, gray, pts0, None,
-            winSize=(15, 15), maxLevel=2,
+            winSize=(11, 11), maxLevel=2,
         )
         self._prev_gray = gray
         if pts1 is None:
@@ -144,7 +172,9 @@ class VehicleTracker:
 
         dx = pts1[good, 0, 0] - pts0[good, 0, 0]
         dy = pts1[good, 0, 1] - pts0[good, 0, 1]
-        ego = (float(np.median(dx)), float(np.median(dy)))
+        
+        # Scale the translation vector back to original frame coordinates
+        ego = (float(np.median(dx) / scale), float(np.median(dy) / scale))
         self._last_ego = ego
         return ego
 
@@ -160,17 +190,17 @@ class VehicleTracker:
 
     def get_static_tracks_with_duration(self, min_frames: int = 20) -> list[tuple]:
         """Statik track'leri (bbox, duration_sec) çiftleri olarak döner."""
-        now = time.time()
         out = []
         for tr in self._tracks.values():
             if tr.frames_seen >= min_frames and tr.is_static(
                 self.min_history, self.max_disp_ratio
             ):
-                out.append((tuple(tr.bbox), now - tr.first_seen))
+                out.append((tuple(tr.bbox), tr.duration))
         return out
 
     def update(self, detections: list[dict],
-               frame: Optional[np.ndarray] = None) -> List[bool]:
+               frame: Optional[np.ndarray] = None,
+               dt: float = 0.033) -> List[bool]:
         """Tracker'ı detections ile güncelle, her detection için is_static döner.
 
         `frame` verilirse ego-motion (optik akış) düzeltmesi uygulanır:
@@ -189,6 +219,9 @@ class VehicleTracker:
                     ((px + ego_dx, py + ego_dy) for (px, py) in tr.history),
                     maxlen=tr.history.maxlen,
                 )
+                # Ayrıca tr.bbox'ı da kaydır (ego-motion compensation)
+                b = tr.bbox
+                tr.bbox = [b[0] + ego_dx, b[1] + ego_dy, b[2] + ego_dx, b[3] + ego_dy]
 
         n = len(detections)
         assigned: list[_Track | None] = [None] * n
@@ -202,14 +235,22 @@ class VehicleTracker:
                 if v > best_iou:
                     best_iou, best_i = v, i
             if best_i >= 0 and best_iou >= self.iou_threshold:
-                tr.update(detections[best_i]["bbox"])
+                tr.update(detections[best_i]["bbox"], detections[best_i].get("confidence", 0.8), dt)
                 assigned[best_i] = tr
             else:
                 tr.miss()
 
         for i in range(n):
             if assigned[i] is None:
-                tr = _Track(self._next_id, detections[i]["bbox"], self.history_len)
+                d = detections[i]
+                tr = _Track(
+                    self._next_id,
+                    d["bbox"],
+                    self.history_len,
+                    d.get("class_id", 2),
+                    d.get("confidence", 0.8)
+                )
+                tr.duration = dt
                 self._tracks[self._next_id] = tr
                 assigned[i] = tr
                 self._next_id += 1
@@ -221,3 +262,21 @@ class VehicleTracker:
             tr.is_static(self.min_history, self.max_disp_ratio) if tr else False
             for tr in assigned
         ]
+
+    def get_missed_detections(self) -> list[dict]:
+        """YOLO'nun kaçırdığı fakat tracker'ın hala aktif tuttuğu araçları döner."""
+        out = []
+        active_boxes = [tr.bbox for tr in self._tracks.values() if tr.misses == 0]
+        for tr in self._tracks.values():
+            if tr.misses > 0:
+                # Suppress missed tracks that overlap significantly with any active track to prevent duplicates
+                if any(_iou(tr.bbox, ab) > 0.40 for ab in active_boxes):
+                    continue
+                out.append({
+                    "bbox": list(tr.bbox),
+                    "class_id": tr.class_id,
+                    "confidence": tr.confidence,
+                    "tracker_miss": True,
+                    "is_static": tr.is_static(self.min_history, self.max_disp_ratio)
+                })
+        return out

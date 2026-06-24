@@ -17,7 +17,9 @@ class VehicleDetector:
 
         self.model_path = str(model_path)
         self.model = YOLO(self.model_path)
-        self.model.to("cpu")
+        import torch
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model.to(self.device)
         self.conf = conf
         self.iou = iou
 
@@ -46,6 +48,7 @@ class VehicleDetector:
             iou=self.iou,
             classes=self.filter_classes,
             verbose=False,
+            half=(self.device == "cuda"),
         )[0]
 
         detections = []
@@ -68,7 +71,31 @@ class VehicleDetector:
                 "class_name": self.class_map.get(class_id, "vehicle"),
             })
 
-        return detections
+        # Sınıf-bağımsız NMS dedup: YOLO'nun dahili NMS'i sınıf-bazlıdır; aynı
+        # araç birden çok sınıfta (ör. car + truck) çıkıp çift sayılabilir.
+        # Yüksek güvenli kutuyu tut, %60+ örtüşen düşük güvenliyi ele.
+        return self._dedupe(detections, iou_thresh=0.6)
+
+    @staticmethod
+    def _iou(a, b) -> float:
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+        inter = iw * ih
+        union = ((ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter)
+        return inter / union if union > 0 else 0.0
+
+    @classmethod
+    def _dedupe(cls, detections: list[dict], iou_thresh: float = 0.6) -> list[dict]:
+        """Greedy sınıf-bağımsız NMS: yüksek güvenliyi tut, çok örtüşeni ele."""
+        order = sorted(detections, key=lambda d: -d["confidence"])
+        kept: list[dict] = []
+        for d in order:
+            if all(cls._iou(d["bbox"], k["bbox"]) <= iou_thresh for k in kept):
+                kept.append(d)
+        return kept
 
     def draw(self, frame: np.ndarray, detections: list[dict]) -> np.ndarray:
         """Draw bounding boxes on frame."""

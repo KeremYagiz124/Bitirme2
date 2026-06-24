@@ -75,6 +75,7 @@ class StreetParkingDetector:
         match_iou: float           = 0.35,
         # Park yönü: "parallel" (sokak/yan kamera) | "perpendicular" (dik park/üstten)
         orientation: str           = "parallel",
+        perspective_correction: bool = False,
     ):
         self.min_gap_ratio            = min_gap_ratio
         self.max_gap_ratio            = max_gap_ratio
@@ -104,6 +105,7 @@ class StreetParkingDetector:
         self.smoothing_min_hits       = smoothing_min_hits
         self.match_iou                = match_iou
         self.orientation              = orientation
+        self.perspective_correction   = perspective_correction
 
         self._history: deque = deque(maxlen=smoothing_frames)
 
@@ -411,7 +413,7 @@ class StreetParkingDetector:
         return ratio >= min_ratio
 
     # ── Yol yüzeyi renk referansı (eski yöntem, fallback) ─────────
-    def _road_color_ref(self, frame, parked):
+    def _road_color_ref(self, frame, parked, hsv_frame=None):
         """Park etmiş araçların hemen altındaki şeritlerin HSV-medyanı.
 
         Yol yüzeyinin (asfalt/parke) tipik renk dağılımını yakalar.
@@ -430,16 +432,22 @@ class StreetParkingDetector:
             sx2 = int(min(w, b[2] - 0.1 * (b[2] - b[0])))
             if sy2 - sy1 < 2 or sx2 - sx1 < 2:
                 continue
-            roi = frame[sy1:sy2, sx1:sx2]
-            if roi.size == 0:
+            if hsv_frame is not None:
+                roi_hsv = hsv_frame[sy1:sy2, sx1:sx2]
+            else:
+                roi = frame[sy1:sy2, sx1:sx2]
+                if roi.size == 0:
+                    continue
+                roi_hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+            if roi_hsv.size == 0:
                 continue
-            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-            samples.append(np.median(hsv.reshape(-1, 3), axis=0))
+            samples.append(np.median(roi_hsv.reshape(-1, 3), axis=0))
         if not samples:
             return None
         return np.median(np.array(samples), axis=0)
 
-    def _slot_looks_like_road(self, frame, slot, ref) -> bool:
+
+    def _slot_looks_like_road(self, frame, slot, ref, hsv_frame=None) -> bool:
         """Slot'un alt yarısında yol benzeri renk var mı?
 
         Kontrol 1: Açık yeşill bitki/çim piksel oranı (bahçe/bollard reddi)
@@ -456,16 +464,19 @@ class StreetParkingDetector:
         sx2 = int(min(w, x2 - 0.08 * (x2 - x1)))
         if sy2 - sy1 < 2 or sx2 - sx1 < 2:
             return True
-        roi = frame[sy1:sy2, sx1:sx2]
-        if roi.size == 0:
+        if hsv_frame is not None:
+            roi_hsv = hsv_frame[sy1:sy2, sx1:sx2]
+        else:
+            roi = frame[sy1:sy2, sx1:sx2]
+            if roi.size == 0:
+                return True
+            roi_hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        if roi_hsv.size == 0:
             return True
-        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        flat = hsv.reshape(-1, 3).astype(np.float32)
+        flat = roi_hsv.reshape(-1, 3)
 
         # --- Kontrol 1: Yeşil bitki tespiti ---
-        # Hue 35-85 (yeşil tonlar) VE saturation >= 55 (doygun yeşil)
-        # Bu çift koşul: beyaz çizgiler (S≈0), gri asfalt (S≈0-20) ve
-        # gölgeli zeminleri YANLIŞLIKLA bitki saymaz.
+        # Hue 35-85 (yeşil tonlar) VE saturation >= 70 (doygun yeşil)
         green_mask = (flat[:, 0] >= 35) & (flat[:, 0] <= 85) & (flat[:, 1] >= 70)
         if np.mean(green_mask) > 0.40:   # >%40 doygun yeşil piksel → bitki alanı
             return False
@@ -474,13 +485,14 @@ class StreetParkingDetector:
         if ref is None:
             return True
         med = np.median(flat, axis=0)
-        dh = abs(med[0] - ref[0])
-        dh = min(dh, 180 - dh)
-        ds = abs(med[1] - ref[1])
-        dv = abs(med[2] - ref[2])
+        dh = abs(float(med[0]) - float(ref[0]))
+        dh = min(dh, 180.0 - dh)
+        ds = abs(float(med[1]) - float(ref[1]))
+        dv = abs(float(med[2]) - float(ref[2]))
         return (dh <= self.road_color_tol_h
                 and ds <= self.road_color_tol_s
                 and dv <= self.road_color_tol_v)
+
 
     # ── Engel kontrolü ────────────────────────────────────────────
     def _slot_blocked(self, slot, obstacles) -> bool:
@@ -502,13 +514,39 @@ class StreetParkingDetector:
         return False
 
     # ── Ham tespit ────────────────────────────────────────────────
-    def _detect_in_row(self, row, frame, obstacles, road_ref, road_mask):
+    def _detect_in_row(self, row, frame, obstacles, road_ref, road_mask, hsv_frame=None, ref_car_length_m=4.5, ref_car_width_m=2.0):
         h, w = frame.shape[:2]
         empty = []
         if not row:
             return empty
 
-        width_at, height_at, med_w, med_h = self._perspective_fit(row)
+        # Sınırda kırpılmış araçları perspektif uydurmasından hariç tut (ölçek sapmasını engellemek için)
+        row_for_fit = [b for b in row if not (b[0] <= 8 or b[2] >= w - 8)]
+        if not row_for_fit:
+            row_for_fit = row
+        _width_at, height_at, med_w, med_h = self._perspective_fit(row_for_fit)
+        
+        # Genişlik ölçek faktörü (bbox piksel genişliğinden beklenen otopark slotu piksel genişliğine geçiş)
+        # Kırpılmış araç kutusu (perspective_correction=True): eni (width) temsil eder.
+        # Yan otopark dik görünüm hariç her durumda bu böyledir.
+        if self.perspective_correction and self.orientation == "perpendicular":
+            if getattr(self, "_perp_side_view", False):
+                ref_w_meters = ref_car_length_m
+            else:
+                ref_w_meters = ref_car_width_m
+        else:
+            ref_w_meters = ref_car_width_m if (self.orientation == "perpendicular" and not getattr(self, "_perp_side_view", False)) else ref_car_length_m
+
+        if self.orientation == "parallel":
+            slot_w_meters = ref_car_length_m
+        else:
+            if getattr(self, "_perp_side_view", False):
+                slot_w_meters = ref_car_length_m
+            else:
+                slot_w_meters = ref_car_width_m
+
+        scale_factor_w = slot_w_meters / ref_w_meters
+        width_at = lambda x: _width_at(x) * scale_factor_w
         frame_edge_margin = self.frame_edge_margin_ratio * w
         max_edge_ext      = self.max_edge_extension_ratio * w
 
@@ -527,14 +565,12 @@ class StreetParkingDetector:
             local_h = height_at(mid_x)
             if gap_w < eff_min_gap * local_w:
                 return
-            # Dik modda bölme yapma: her boşluk tek slot — kullanıcı aracının
-            # toplam alana sığıp sığmadığı doğrudan kontrol edilir.
-            # Paralel modda normal bölme uygulanır.
-            if self.orientation == "perpendicular":
-                n = 1
-            else:
-                n = max(1, int(round(gap_w / local_w)))
-                n = min(n, self.max_spaces_per_gap)
+            # Boşluğu alt slotlara böl.
+            # Güvenlik marjı: dik parkta 1.0x (tıkız), paralel parkta 1.15x.
+            slot_ratio = 1.0 if self.orientation == "perpendicular" else 1.15
+            min_slot_w = local_w * slot_ratio
+            n = max(1, int(np.floor(gap_w / min_slot_w)))
+            n = min(n, self.max_spaces_per_gap)
             y2 = int(min(h, base_bot))
             if self.orientation == "perpendicular" and not _perp_side:
                 # Ön görünümde slot yüksekliği ignore_top sınırına kadar uzar;
@@ -549,9 +585,9 @@ class StreetParkingDetector:
                 sx2 = int(gap_x1 + (j + 1) * step)
                 slot_w = sx2 - sx1
                 slot_h = y2 - y1
-                # Ön görünüm dik park: slot dikey ağırlıklı olmalı (portrait)
+                # Ön görünüm dik park: geniş boşluklar kabul (box-to-box).
                 if self.orientation == "perpendicular" and not _perp_side:
-                    if slot_h > 0 and not (0.15 <= slot_w / slot_h <= 2.5):
+                    if slot_h > 0 and not (0.10 <= slot_w / slot_h <= 5.0):
                         continue
                 else:
                     if slot_h > 0 and not (0.25 <= slot_w / slot_h <= 6.0):
@@ -560,9 +596,10 @@ class StreetParkingDetector:
                 if self._slot_blocked(slot, obstacles):
                     continue
                 # Bitki/çim alanı kontrolü (bahçe, park, yeşil alan reddi)
-                if not self._slot_looks_like_road(frame, slot, None):
+                if not self._slot_looks_like_road(frame, slot, None, hsv_frame=hsv_frame):
                     continue
                 empty.append(slot)
+
 
         # Bitişik araç-arası
         for i in range(len(row) - 1):
@@ -595,22 +632,23 @@ class StreetParkingDetector:
             rightmost = row[-1]
 
             left_gap_x2 = leftmost[0]
-            left_gap_x1 = max(0.0, left_gap_x2 - max_edge_ext)
-            _add(left_gap_x1, left_gap_x2, leftmost[3])
+            left_gap_x1 = max(frame_edge_margin, left_gap_x2 - max_edge_ext)
+            if left_gap_x2 > left_gap_x1:
+                _add(left_gap_x1, left_gap_x2, leftmost[3])
 
             right_gap_x1 = rightmost[2]
-            right_gap_x2 = min(float(w), right_gap_x1 + max_edge_ext)
-            _add(right_gap_x1, right_gap_x2, rightmost[3])
+            right_gap_x2 = min(float(w) - frame_edge_margin, right_gap_x1 + max_edge_ext)
+            if right_gap_x2 > right_gap_x1:
+                _add(right_gap_x1, right_gap_x2, rightmost[3])
 
         return empty
 
     def _detect_raw(self, frame, detections, obstacles, static_mask,
-                    external_road_mask=None):
-        candidates = self._filter_candidates(frame.shape, detections, static_mask)
-        # Fallback: static_mask çok sıkı veya tracker henüz olgunlaşmadıysa
-        # tüm araç tespitlerini kullan ki park sırası yine de oluşsun.
-        if not candidates and detections:
-            candidates = self._filter_candidates(frame.shape, detections, None)
+                    external_road_mask=None, ref_car_length_m=4.5, ref_car_width_m=2.0):
+        # Sıra oluşturmak ve boşluk hesaplamak için tüm algılanan araçları kullanıyoruz.
+        # Bu sayede tracker'ın henüz statik olarak doğrulamadığı araçlar da sıraya dahil edilir ve aradaki boşluklar kaçırılmaz.
+        # Hareketli araçlar zaten temporal smoothing ve anlık araç çakışma filtreleriyle elenecektir.
+        candidates = self._filter_candidates(frame.shape, detections, None)
         rows       = self._cluster_rows(candidates)
 
         # Dik mod: görüş açısını otomatik tespit et
@@ -631,16 +669,20 @@ class StreetParkingDetector:
         all_parked: list = []
         for r in rows:
             all_parked.extend(r)
+
+        # Convert whole frame to HSV once for faster ROI color checks
+        hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV) if self.road_color_check else None
+
         if external_road_mask is not None:
             road_mask = external_road_mask
             # Çift doğrulama: Hem dış maske hem de renk referansı hesaplanır.
             # road_mask geçmesi gerekli ama AYRICA renk benzerliği de kontrol edilir.
-            road_ref = (self._road_color_ref(frame, all_parked)
+            road_ref = (self._road_color_ref(frame, all_parked, hsv_frame=hsv_frame)
                         if self.road_color_check else None)
         else:
             road_mask = (self._build_road_mask(frame, all_parked)
                          if self.road_color_check else None)
-            road_ref  = (self._road_color_ref(frame, all_parked)
+            road_ref  = (self._road_color_ref(frame, all_parked, hsv_frame=hsv_frame)
                          if self.road_color_check else None)
         self._last_road_mask = road_mask  # debug/görsel için
 
@@ -649,13 +691,44 @@ class StreetParkingDetector:
         for row in rows:
             parked.extend(row)
             empty_spaces.extend(
-                self._detect_in_row(row, frame, obstacles, road_ref, road_mask)
+                self._detect_in_row(row, frame, obstacles, road_ref, road_mask, hsv_frame=hsv_frame,
+                                    ref_car_length_m=ref_car_length_m, ref_car_width_m=ref_car_width_m)
             )
 
-        # Aynı slotu birden çok sıra üretebilir: yüksek IoU duplikalarını ele
+
+        # Araçların üstüne gelen/çakışan slotları filtrele
+        # Perspektif düzeltilmiş bbox kullan (raw_bbox geniş olup komşu slotu hatalı engelleyebilir)
+        VEHICLE_CLASSES = {2, 3, 5, 7}  # otomobil, motosiklet, otobüs, kamyon
+        vehicle_boxes = [d["bbox"] for d in detections if d.get("class_id") in VEHICLE_CLASSES]
+        
+        filtered_empty_spaces = []
+        for s in empty_spaces:
+            if not self._slot_blocked_by_vehicle(s, vehicle_boxes):
+                filtered_empty_spaces.append(s)
+        empty_spaces = filtered_empty_spaces
+
+        # Aynı slotu birden çok sıra üretebilir: yüksek IoU veya IoM (Intersection over Minimum Area) duplikalarını ele
         deduped: list = []
         for s in empty_spaces:
-            if not any(_bbox_iou(s, e) > 0.6 for e in deduped):
+            is_dup = False
+            for e in deduped:
+                iou = _bbox_iou(s, e)
+                # Intersection over Minimum Area
+                sx1, sy1, sx2, sy2 = s
+                ex1, ey1, ex2, ey2 = e
+                ix1, iy1 = max(sx1, ex1), max(sy1, ey1)
+                ix2, iy2 = min(sx2, ex2), min(sy2, ey2)
+                iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+                inter = iw * ih
+                area_s = (sx2 - sx1) * (sy2 - sy1)
+                area_e = (ex2 - ex1) * (ey2 - ey1)
+                min_area = min(area_s, area_e)
+                iom = inter / min_area if min_area > 0 else 0.0
+                
+                if iou > 0.45 or iom > 0.60:
+                    is_dup = True
+                    break
+            if not is_dup:
                 deduped.append(s)
 
         return deduped, parked, rows
@@ -675,25 +748,159 @@ class StreetParkingDetector:
                 confirmed.append(cur)
         return confirmed
 
+    @staticmethod
+    def _slot_blocked_by_vehicle(slot, vehicle_boxes) -> bool:
+        sx1, sy1, sx2, sy2 = slot
+        slot_area = (sx2 - sx1) * (sy2 - sy1)
+        if slot_area <= 0:
+            return True
+        for vx1, vy1, vx2, vy2 in vehicle_boxes:
+            # 1) Center point containment check
+            v_cx = (vx1 + vx2) / 2.0
+            v_cy = (vy1 + vy2) / 2.0
+            if sx1 <= v_cx <= sx2 and sy1 <= v_cy <= sy2:
+                return True
+            
+            # 2) Overlap ratio check
+            ix1 = max(sx1, vx1)
+            iy1 = max(sy1, vy1)
+            ix2 = min(sx2, vx2)
+            iy2 = min(sy2, vy2)
+            iw = ix2 - ix1
+            ih = iy2 - iy1
+            if iw > 0 and ih > 0:
+                inter_area = iw * ih
+                veh_area = (vx2 - vx1) * (vy2 - vy1)
+                if inter_area / slot_area > 0.15 or (veh_area > 0 and inter_area / veh_area > 0.20):
+                    return True
+        return False
+
+    @staticmethod
+    def _class_for_box(box, detections) -> str | None:
+        """Kutunun (box) hangi algılanan araca ait olduğunu IoU ile bulur ve sınıf adını döner."""
+        if not detections:
+            return None
+        best_iou = 0.0
+        best_class = None
+        for d in detections:
+            d_box = d.get("bbox")
+            if d_box is None:
+                continue
+            iou = _bbox_iou(box, d_box)
+            if iou > best_iou:
+                best_iou = iou
+                best_class = d.get("class_name")
+        if best_iou >= 0.4:
+            return best_class
+        return None
+
+    @staticmethod
+    def _real_dim_for(class_name: str | None, is_width: bool, default_car_len: float = 4.5, default_car_width: float = 2.0) -> float:
+        """Sınıf adına göre gerçek dünya boyutunu (uzunluk veya genişlik) döner."""
+        dims = {
+            "car": (default_car_len, default_car_width),
+            "bus": (12.0, 2.5),
+            "truck": (8.0, 2.5),
+            "motorcycle": (2.0, 0.8),
+        }
+        if not class_name or class_name not in dims:
+            return default_car_width if is_width else default_car_len
+        return dims[class_name][1] if is_width else dims[class_name][0]
+
     # ── Ölçek tahmini (park edilmiş araçlar → piksel/metre) ──────
     @staticmethod
-    def estimate_scale(rows: list, ref_car_length_m: float = 4.5) -> float | None:
+    def estimate_scale(
+        rows: list,
+        ref_car_length_m: float = 4.5,
+        detections: list[dict] | None = None,
+        is_width: bool = False,
+        ref_car_width_m: float = 2.0,
+        frame_shape: tuple[int, int] | None = None,
+        orientation: str = "parallel",
+        perspective_correction: bool = False,
+    ) -> float | None:
         """Park sırasındaki araç piksel genişliklerinden m/px ölçeği hesapla.
 
-        Yan kamera görüşünde araç piksel genişliği ≈ araç uzunluğu.
-        ref_car_length_m: referans araç uzunluğu (varsayılan: ortalama otomobil 4.5m).
-        Döner: m/px (None = yeterli veri yok).
+        Sınıf-duyarlı (class-aware) modda her araca ait sınıfın gerçek boyutu
+        kullanılarak daha hassas ölçek tahmini yapılır.
+        
+        frame_shape sağlandığında, araçların kameraya göre olan açısal sapması (yaw)
+        tahmin edilerek perspektif daralması/genişlemesi otomatik olarak düzeltilir.
         """
-        widths_px = []
+        import math
+        scales = []
         for row in rows:
             for b in row:
-                widths_px.append(b[2] - b[0])
-        if not widths_px:
+                px_w = b[2] - b[0]
+                if px_w < 1:
+                    continue
+                
+                if detections:
+                    cname = StreetParkingDetector._class_for_box(b, detections)
+                    real_len = StreetParkingDetector._real_dim_for(cname, False, ref_car_length_m, ref_car_width_m)
+                    real_wid = StreetParkingDetector._real_dim_for(cname, True, ref_car_length_m, ref_car_width_m)
+                else:
+                    real_len = ref_car_length_m
+                    real_wid = ref_car_width_m
+                
+                # Eğer frame_shape verilmişse ve perspective_correction aktifse otomatik açı düzeltmesi uygula
+                if frame_shape is not None and perspective_correction:
+                    h, w = frame_shape[:2]
+                    cx = (b[0] + b[2]) / 2.0
+                    cy = (b[1] + b[3]) / 2.0
+                    f = w  # tahmini odak uzaklığı
+                    dx = (cx - w / 2.0) / f
+                    dy = (cy - h / 2.0) / f
+                    theta = math.atan(math.sqrt(dx**2 + dy**2))
+                    
+                    if orientation == "parallel":
+                        expected_dim = real_len * math.sin(theta) + real_wid * math.cos(theta)
+                    else:
+                        expected_dim = real_len * math.cos(theta) + real_wid * math.sin(theta)
+                else:
+                    expected_dim = real_wid if is_width else real_len
+                
+                scales.append(expected_dim / px_w)
+        if not scales:
             return None
-        med_px = float(np.median(widths_px))
-        if med_px < 1:
+        return float(np.median(scales))
+
+    @staticmethod
+    def estimate_local_scale(y: float, y_scales: list[tuple[float, float]]) -> float | None:
+        """Belirli bir Y koordinatındaki yerel piksel/metre ölçeğini hesapla.
+        
+        y_scales: [(y_bottom, local_scale), ...] çiftleri listesi.
+        """
+        if not y_scales:
             return None
-        return ref_car_length_m / med_px  # metre / piksel
+        if len(y_scales) < 2:
+            return y_scales[0][1]
+        
+        # scale = a * y + b lineer modelini fit et
+        ys = np.array([item[0] for item in y_scales], dtype=np.float32)
+        ss = np.array([item[1] for item in y_scales], dtype=np.float32)
+        
+        if np.std(ys) < 1e-2:
+            dists = [abs(item[0] - y) for item in y_scales]
+            closest_idx = int(np.argmin(dists))
+            return y_scales[closest_idx][1]
+        
+        try:
+            a, b = np.polyfit(ys, ss, 1)
+            pred = a * y + b
+            if pred > 0:
+                # Eğim mantıklı olmalı (yaklaştıkça/Y arttıkça piksel başına metre azalmalı).
+                # Aşırı sapmaları engellemek için mevcut gözlemlerin sınırları dahilinde kırp.
+                min_s = float(np.min(ss)) * 0.4
+                max_s = float(np.max(ss)) * 2.5
+                return float(np.clip(pred, min_s, max_s))
+        except Exception:
+            pass
+            
+        # Fallback: Y değerine en yakın referans aracın ölçeğini seç
+        dists = [abs(item[0] - y) for item in y_scales]
+        closest_idx = int(np.argmin(dists))
+        return y_scales[closest_idx][1]
 
     # ── Public API ────────────────────────────────────────────────
     def analyze(
@@ -705,10 +912,15 @@ class StreetParkingDetector:
         external_road_mask: np.ndarray | None = None,
         ref_car_length_m: float = 4.5,
         ref_car_width_m: float  = 2.0,
+        ipm = None,
     ) -> dict:
+        import math
+        
         raw_empty, parked, rows = self._detect_raw(
             frame, detections, obstacles or [], static_mask,
             external_road_mask=external_road_mask,
+            ref_car_length_m=ref_car_length_m,
+            ref_car_width_m=ref_car_width_m,
         )
         confirmed = self._confirm(raw_empty)
 
@@ -716,19 +928,147 @@ class StreetParkingDetector:
         # - Paralel mod: araç uzunluğu (yan görünümde bbox genişliği ≈ araç uzunluğu)
         # - Dik-yan görünüm: araç uzunluğu (bbox genişliği yine araç uzunluğu)
         # - Dik-ön görünüm: araç eni (bbox genişliği ≈ araç eni)
-        if self.orientation == "perpendicular" and not getattr(self, "_perp_side_view", False):
-            ref_dim = ref_car_width_m
-        else:
-            ref_dim = ref_car_length_m
-        scale = self.estimate_scale(rows, ref_dim)
+        is_width = (self.orientation == "perpendicular" and not getattr(self, "_perp_side_view", False))
+        
+        # 1) BEV (Kuş Bakışı) tabanlı geometrik açı düzeltmeli ölçek hesabı
+        bev_scale = None
+        if ipm is not None and ipm.H is not None:
+            bev_scales = []
+            for pass_idx in [0, 1]:
+                if bev_scales:
+                    break
+                for row in rows:
+                    if not row:
+                        continue
+                    # Sıradaki araçların taban merkezlerini BEV düzlemine taşı
+                    bev_pts = []
+                    for b in row:
+                        pt = ((b[0] + b[2]) / 2.0, b[3])
+                        tp = ipm.transform_points([pt])
+                        if len(tp) > 0:
+                            bev_pts.append(tp[0])
+                    
+                    # Sıradaki araçların merkezlerinden geçen doğruyu fit et (Park sırası yönü)
+                    if len(bev_pts) >= 2:
+                        try:
+                            line_params = cv2.fitLine(np.array(bev_pts, dtype=np.float32), cv2.DIST_L2, 0, 0.01, 0.01)
+                            vx = float(line_params[0][0])
+                            vy = float(line_params[1][0])
+                            alpha = math.atan2(vy, vx)
+                        except Exception:
+                            alpha = math.pi / 2.0
+                    else:
+                        alpha = math.pi / 2.0  # varsayılan dikey doğrultu
+                    
+                    # Park yönelimine (paralel/dik) göre araç uzunluk aksı açısını ayarla
+                    if self.orientation == "perpendicular":
+                        alpha = alpha + math.pi / 2.0
+                    
+                    # Her aracın 2D bbox genişliğini, açısına göre BEV'de dekompoze et
+                    for b in row:
+                        if pass_idx == 0 and frame is not None:
+                            _, w_f = frame.shape[:2]
+                            if b[0] <= 8 or b[2] >= w_f - 8:
+                                continue
+                        
+                        if detections:
+                            cname = StreetParkingDetector._class_for_box(b, detections)
+                            real_len = StreetParkingDetector._real_dim_for(cname, False, ref_car_length_m, ref_car_width_m)
+                            real_wid = StreetParkingDetector._real_dim_for(cname, True, ref_car_length_m, ref_car_width_m)
+                        else:
+                            real_len = ref_car_length_m
+                            real_wid = ref_car_width_m
+                        
+                        try:
+                            bottom_corners = [(b[0], b[3]), (b[2], b[3])]
+                            tp_corners = ipm.transform_points(bottom_corners)
+                            bx1, by1 = tp_corners[0]
+                            bx2, by2 = tp_corners[1]
+                            px_w_bev = abs(bx2 - bx1)
+                        except Exception:
+                            px_w_bev = 0.0
+                        
+                        if px_w_bev >= 1e-2:
+                            if self.perspective_correction and self.orientation == "perpendicular":
+                                _perp_side = getattr(self, "_perp_side_view", False)
+                                if _perp_side:
+                                    expected_span_m = real_len * abs(math.cos(alpha))
+                                else:
+                                    expected_span_m = real_wid * abs(math.cos(alpha))
+                            else:
+                                expected_span_m = real_len * abs(math.cos(alpha)) + real_wid * abs(math.sin(alpha))
+                            bev_scales.append(expected_span_m / px_w_bev)
+            
+            if bev_scales:
+                bev_scale = float(np.median(bev_scales))
+                ipm.m_per_px = bev_scale
+
+        # 2) Düzlemsel (Image-plane) ölçek hesabı (Fallback / IPM yoksa)
+        y_scales = []
+        for pass_idx in [0, 1]:
+            if y_scales:
+                break
+            for row in rows:
+                for b in row:
+                    px_w = b[2] - b[0]
+                    if px_w < 1:
+                        continue
+                    
+                    if pass_idx == 0 and frame is not None:
+                        _, w_f = frame.shape[:2]
+                        if b[0] <= 8 or b[2] >= w_f - 8:
+                            continue
+                    
+                    if detections:
+                        cname = StreetParkingDetector._class_for_box(b, detections)
+                        real_len = StreetParkingDetector._real_dim_for(cname, False, ref_car_length_m, ref_car_width_m)
+                        real_wid = StreetParkingDetector._real_dim_for(cname, True, ref_car_length_m, ref_car_width_m)
+                    else:
+                        real_len = ref_car_length_m
+                        real_wid = ref_car_width_m
+                    
+                    if frame is not None and self.perspective_correction:
+                        h, w = frame.shape[:2]
+                        cx = (b[0] + b[2]) / 2.0
+                        f = w
+                        dx = (cx - w / 2.0) / f
+                        phi = math.atan(abs(dx))
+                        
+                        if self.orientation == "parallel":
+                            expected_dim = real_len * math.cos(phi)
+                        else:
+                            _perp_side = getattr(self, "_perp_side_view", False)
+                            if _perp_side:
+                                expected_dim = real_len * math.cos(phi)
+                            else:
+                                expected_dim = real_wid * math.cos(phi)
+                    else:
+                        expected_dim = real_wid if is_width else real_len
+                    
+                    local_s = expected_dim / px_w
+                    y_scales.append((b[3], local_s))
+
+        image_scale = float(np.median([item[1] for item in y_scales])) if y_scales else None
+
+        # 3) Slot boyutlarını hesapla
         slot_sizes_m: list[tuple[float, float]] = []
         for (x1, y1, x2, y2) in confirmed:
-            if scale is not None:
-                w_m = (x2 - x1) * scale
-                h_m = (y2 - y1) * scale
+            if bev_scale is not None and ipm is not None:
+                # IPM üzerinden perspektifsiz slot genişlik ve derinlik hesabı
+                bx1, by1, bx2, by2 = ipm.transform_box((x1, y1, x2, y2), ref_car_length_m=ref_car_length_m)
+                w_m = abs(bx2 - bx1) * bev_scale
+                h_m = abs(by2 - by1) * bev_scale
             else:
-                w_m = h_m = 0.0
+                # Düzlemsel yerel ölçek tahmini (Derinliğe/Y koordinatına göre ölçeklendirme)
+                local_scale = self.estimate_local_scale(y2, y_scales) if y_scales else image_scale
+                if local_scale is not None:
+                    w_m = (x2 - x1) * local_scale
+                    h_m = (y2 - y1) * local_scale
+                else:
+                    w_m = h_m = 0.0
             slot_sizes_m.append((round(w_m, 2), round(h_m, 2)))
+
+        final_scale = bev_scale if bev_scale is not None else image_scale
 
         return {
             "parked":         parked,
@@ -739,8 +1079,9 @@ class StreetParkingDetector:
             "occupied_count": len(parked),
             "obstacles":      obstacles or [],
             "slot_sizes_m":   slot_sizes_m,   # [(uzunluk_m, derinlik_m), ...]
-            "scale_m_per_px": scale,           # None = kalibre edilemedi
+            "scale_m_per_px": final_scale,     # None = kalibre edilemedi
             "perp_side_view": getattr(self, "_perp_side_view", False),
+            "y_scales":       y_scales,
         }
 
     def draw(
@@ -796,4 +1137,5 @@ class StreetParkingDetector:
             cv2.putText(out, label, (cx - tw // 2, cy + th // 2),
                         cv2.FONT_HERSHEY_SIMPLEX, font_scale,
                         (255, 255, 255), 2, cv2.LINE_AA)
+        return out
         return out

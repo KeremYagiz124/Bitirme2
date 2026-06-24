@@ -34,6 +34,8 @@ class DrivableAreaSegmenter:
             self._torch = torch
             self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
             self.model = torch.jit.load(model_path, map_location=self.device)
+            if self.device == "cuda":
+                self.model.half()
             self.model.eval()
             self.available = True
         except Exception:
@@ -75,11 +77,13 @@ class DrivableAreaSegmenter:
         lb, pad = self._letterbox(frame)
         img = cv2.cvtColor(lb, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         t = torch.from_numpy(img.transpose(2, 0, 1)).unsqueeze(0).to(self.device)
-        with torch.no_grad():
+        if self.device == "cuda":
+            t = t.half()
+        with torch.inference_mode():
             out = self.model(t)
         # out: (det, drivable[1,2,H,W], lane[1,1,H,W])
         da_mask = out[1].argmax(1).squeeze().to("cpu").numpy().astype(np.uint8) * 255
-        ll_t = out[2].squeeze().to("cpu")
+        ll_t = out[2].squeeze().to("cpu").float()
         ll_mask = (torch.sigmoid(ll_t).numpy() > 0.5).astype(np.uint8) * 255
 
         da_full = self._unletterbox(da_mask, pad, (h0, w0))

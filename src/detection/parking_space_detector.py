@@ -18,7 +18,9 @@ class ParkingSpaceDetector:
     def __init__(self, model_path: str, conf: float = 0.4):
         from ultralytics import YOLO
         self.model = YOLO(str(model_path))
-        self.model.to("cpu")
+        import torch
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model.to(self.device)
         self.conf = conf
         self._build_class_map()
 
@@ -40,7 +42,7 @@ class ParkingSpaceDetector:
                 self._color_map[cls_id]  = (128, 128, 128)
 
     def detect(self, frame: np.ndarray) -> list[dict]:
-        results = self.model(frame, conf=self.conf, verbose=False)[0]
+        results = self.model(frame, conf=self.conf, verbose=False, half=(self.device == "cuda"))[0]
         detections = []
         for box in results.boxes:
             cls_id = int(box.cls[0])
